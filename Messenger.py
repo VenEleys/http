@@ -6,6 +6,8 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs
 from datetime import datetime
+import time
+import re
 
 # Папка для хранения данных
 DATA_DIR = 'db'
@@ -27,6 +29,7 @@ REDIRECT_URL = "https://www.google.com"
 
 ADMIN_MODE = '-a' in sys.argv
 SHOW_COMMANDS = '-sh' in sys.argv
+NO_ACTIVE = '-noact' in sys.argv
 
 REFRESH_INTERVAL = 2000
 if '-cd' in sys.argv:
@@ -57,6 +60,9 @@ SERVER_IP = get_local_ip()
 active_users = {}
 active_users_lock = threading.Lock()
 
+last_message_cache = {}
+last_message_lock = threading.Lock()
+
 def load_users():
     try:
         with open(USERS_FILE, 'r') as f:
@@ -85,6 +91,16 @@ def get_nickname(ip):
         return user_data.get('nickname', 'Unknown')
     return user_data
 
+def get_ip_by_nickname(nickname):
+    users = load_users()
+    for ip, user_data in users.items():
+        if isinstance(user_data, dict):
+            if user_data.get('nickname') == nickname:
+                return ip
+        elif user_data == nickname:
+            return ip
+    return None
+
 def set_nickname(ip, nickname):
     users = load_users()
     if ip in users and isinstance(users[ip], dict):
@@ -97,21 +113,20 @@ def set_nickname(ip, nickname):
     save_users(users)
 
 def get_nickname_color(ip):
-    # Генерируем цвет на основе IP
     hash_val = 0
     for c in ip:
         hash_val = (hash_val * 31 + ord(c)) % 360
-    # Возвращаем цвет в формате HSL (насыщенность 70%, яркость 45% для читаемости на светлом фоне)
-    return f"hsl({hash_val}, 70%, 35%)"
+    return f"hsl({hash_val}, 65%, 40%)"
 
 ADMIN_MODE_STR = str(ADMIN_MODE).lower()
-SHOW_COMMANDS_STR = str(SHOW_COMMANDS).lower()
 
 ARGS_LIST = []
 if ADMIN_MODE:
     ARGS_LIST.append('-a')
 if SHOW_COMMANDS:
     ARGS_LIST.append('-sh')
+if NO_ACTIVE:
+    ARGS_LIST.append('-noact')
 if '-cd' in sys.argv:
     try:
         idx = sys.argv.index('-cd')
@@ -141,13 +156,76 @@ HTML = f'''<!DOCTYPE html>
             box-shadow: 0 1px 2px rgba(0,0,0,0.05);
         }}
         .msg:hover {{ background: #fff3e0; }}
+        .msg.own-message {{
+            background: #e8f4e8;
+            border-left: 3px solid #4ec9b0;
+        }}
+        .msg.mention {{
+            background: #fff0d0;
+            border-left: 3px solid #d4a017;
+            box-shadow: 0 0 5px rgba(212,160,23,0.3);
+        }}
+        .msg.command-message {{
+            background: #e0e0e0;
+            border-left: 3px solid #888;
+        }}
+        .msg.whisper {{
+            background: #e8e0f0;
+            border-left: 3px solid #9b59b6;
+        }}
         .time {{ color: #8B6914; font-size: 12px; font-weight: 500; }}
-        .ip {{ color: #888; font-size: 10px; margin-left: 5px; cursor: pointer; }}
-        .ip:hover {{ text-decoration: underline; }}
-        .nickname {{ font-weight: bold; cursor: pointer; }}
-        .nickname:hover {{ text-decoration: underline; }}
+        .ip {{ color: #888; font-size: 10px; margin-left: 5px; }}
+        .nickname {{ font-weight: bold; }}
         .text {{ color: #333; white-space: pre-wrap; }}
-        .panel {{ background: #3c3c3c; padding: 15px; border-top: 1px solid #4a4a4a; }}
+        .whisper-label {{
+            color: #9b59b6;
+            font-size: 10px;
+            font-weight: bold;
+            margin-right: 6px;
+        }}
+        .mention-highlight {{
+            background-color: #ffeb3b;
+            color: #333;
+            padding: 0 2px;
+            border-radius: 3px;
+            font-weight: bold;
+        }}
+        .admin-badge-inline {{
+            background: #8B0000;
+            color: white;
+            font-size: 10px;
+            font-weight: bold;
+            padding: 2px 5px;
+            border-radius: 10px;
+            margin-left: 6px;
+            display: inline-block;
+        }}
+        .panel {{
+            background: #3c3c3c;
+            padding: 15px;
+            border-top: 1px solid #4a4a4a;
+            display: flex;
+            gap: 20px;
+            align-items: flex-start;
+            resize: vertical;
+            overflow: auto;
+            min-height: 150px;
+        }}
+        .left-panel {{
+            flex: 1;
+        }}
+        .right-panel {{
+            width: 180px;
+            background: #2d2d2d;
+            border-radius: 8px;
+            padding: 10px;
+            border: 1px solid #4a4a4a;
+            max-height: 150px;
+            overflow-y: auto;
+            resize: horizontal;
+            min-width: 120px;
+            max-width: 300px;
+        }}
         .nickname-row {{ display: flex; gap: 10px; margin-bottom: 10px; align-items: center; }}
         .nickname-row label {{ font-weight: bold; color: #4ec9b0; }}
         #nicknameInput {{ width: 200px; padding: 8px; border: 1px solid #555; border-radius: 4px; font-size: 14px; font-family: monospace; background: #3c3c3c; color: #d4d4d4; }}
@@ -166,7 +244,7 @@ HTML = f'''<!DOCTYPE html>
             border-left: 3px solid #f48771;
         }}
         .warning.success {{ color: #4ec9b0; background: #1e3a2f; border-left-color: #4ec9b0; }}
-        .input-row {{ display: flex; gap: 10px; align-items: flex-end; }}
+        .input-row {{ position: relative; display: flex; gap: 10px; align-items: flex-end; }}
         #messageInput {{ flex: 1; padding: 8px; border: 1px solid #555; border-radius: 4px; font-size: 14px; font-family: monospace; resize: vertical; background: #3c3c3c; color: #d4d4d4; }}
         #messageInput:focus {{ outline: none; border-color: #4ec9b0; }}
         #messageInput:disabled {{ background: #2a2a2a; color: #858585; }}
@@ -251,37 +329,32 @@ HTML = f'''<!DOCTYPE html>
         .menu-item:hover {{
             background: #3c3c3c;
         }}
-        .active-users {{
-            position: fixed;
-            bottom: 100px;
-            right: 20px;
-            background: #2d2d2d;
-            border-radius: 8px;
-            padding: 10px;
-            min-width: 150px;
-            border: 1px solid #4a4a4a;
-            z-index: 1000;
-            font-size: 12px;
-            max-height: 200px;
-            overflow-y: auto;
-        }}
         .active-users-title {{
             color: #4ec9b0;
             font-weight: bold;
             margin-bottom: 8px;
             border-bottom: 1px solid #4a4a4a;
             padding-bottom: 4px;
+            cursor: ns-resize;
         }}
         .active-user {{
             padding: 3px 0;
             color: #d4d4d4;
+            display: flex;
+            align-items: center;
+            gap: 6px;
             cursor: pointer;
-        }}
-        .active-user.online {{
-            color: #4ec9b0;
         }}
         .active-user:hover {{
             text-decoration: underline;
+        }}
+        .active-user-badge {{
+            background: #8B0000;
+            color: white;
+            font-size: 9px;
+            font-weight: bold;
+            padding: 1px 4px;
+            border-radius: 8px;
         }}
         .char-counter {{
             font-size: 11px;
@@ -291,6 +364,29 @@ HTML = f'''<!DOCTYPE html>
         }}
         .char-counter.warning {{
             color: #f48771;
+        }}
+        .suggestions {{
+            position: absolute;
+            bottom: 100%;
+            left: 0;
+            background: #2d2d2d;
+            border: 1px solid #4a4a4a;
+            border-radius: 6px;
+            max-height: 150px;
+            overflow-y: auto;
+            z-index: 1001;
+            min-width: 150px;
+        }}
+        .suggestion-item {{
+            padding: 6px 10px;
+            cursor: pointer;
+            color: #d4d4d4;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }}
+        .suggestion-item:hover, .suggestion-item.selected {{
+            background: #3c3c3c;
         }}
         .toast {{
             position: fixed;
@@ -304,16 +400,23 @@ HTML = f'''<!DOCTYPE html>
             font-size: 14px;
             z-index: 2000;
             opacity: 0;
-            transition: opacity 0.3s;
+            transition: opacity 0.2s;
             pointer-events: none;
         }}
         .toast.show {{
             opacity: 1;
         }}
+        .resize-handle {{
+            cursor: ns-resize;
+            text-align: center;
+            font-size: 10px;
+            color: #888;
+            margin-top: 5px;
+        }}
     </style>
 </head>
-<body>
-    <div class="right-menus">
+<body id="mainBody">
+    <div class="right-menus" id="rightMenus">
         <div class="menu-wrapper">
             <div class="admin-menu" id="adminMenuContainer" style="display: none;">
                 <button class="menu-btn admin-btn" id="adminMenuBtn">Админ</button>
@@ -328,6 +431,7 @@ HTML = f'''<!DOCTYPE html>
                 <button class="menu-btn" id="menuBtn">Инструменты</button>
                 <div class="menu-content" id="menuContent">
                     <div class="menu-item"><strong>+ / =</strong> — Нажмите + или =, чтобы закрыть сайт (не работает при вводе текста)</div>
+                    <div class="menu-item" id="cmdTell"><strong>/tell @ник "сообщение"</strong> — Отправить личное сообщение (Шёпот)</div>
                 </div>
             </div>
         </div>
@@ -335,32 +439,37 @@ HTML = f'''<!DOCTYPE html>
             <button class="menu-btn host-btn" id="hostMenuBtn">Хост</button>
             <div class="menu-content" id="hostMenuContent">
                 <div class="menu-item">Аргументы запуска: {ARGS_STRING}</div>
-                <div class="menu-item"><strong>-a</strong> — режим админа (видно IP)</div>
+                <div class="menu-item"><strong>-a</strong> — только хост видит IP</div>
                 <div class="menu-item"><strong>-sh</strong> — показывать команды в чате</div>
+                <div class="menu-item"><strong>-noact</strong> — отключить систему активных пользователей</div>
                 <div class="menu-item"><strong>-cd "мс"</strong> — интервал обновления сообщений</div>
             </div>
         </div>
     </div>
 
     <div id="chat"></div>
-    <div class="active-users" id="activeUsersPanel">
-        <div class="active-users-title">Активные пользователи (нажмите для копирования IP)</div>
-        <div id="activeUsersList">Загрузка...</div>
-    </div>
-    <div class="panel">
-        <div class="nickname-row">
-            <label>Имя:</label>
-            <input type="text" id="nicknameInput" placeholder="Введите имя" maxlength="20">
-            <button id="saveNicknameBtn">Сохранить</button>
+    <div class="panel" id="panel">
+        <div class="left-panel">
+            <div class="nickname-row">
+                <label>Имя:</label>
+                <input type="text" id="nicknameInput" placeholder="Введите имя" maxlength="20">
+                <button id="saveNicknameBtn">Сохранить</button>
+            </div>
+            <div class="warning" id="warning">⚠️ Никнейм не может быть изменен</div>
+            <div class="input-row" id="inputRow">
+                <textarea id="messageInput" rows="2" placeholder="Сообщение... (используйте @ник для упоминания)"></textarea>
+                <button id="sendBtn">Отправить</button>
+                <div id="suggestions" class="suggestions" style="display: none;"></div>
+            </div>
+            <div class="char-counter" id="charCounter">0 / {MAX_MESSAGE_LENGTH}</div>
         </div>
-        <div class="warning" id="warning">⚠️ Никнейм не может быть изменен</div>
-        <div class="input-row">
-            <textarea id="messageInput" rows="2" placeholder="Сообщение..."></textarea>
-            <button id="sendBtn">Отправить</button>
+        <div class="right-panel" id="rightPanel" style="display: {'none' if NO_ACTIVE else 'block'}">
+            <div class="active-users-title">Активные пользователи</div>
+            <div id="activeUsersList">Загрузка...</div>
+            <div class="resize-handle">⋮</div>
         </div>
-        <div class="char-counter" id="charCounter">0 / {MAX_MESSAGE_LENGTH}</div>
     </div>
-    <div class="toast" id="toast">IP скопирован!</div>
+    <div id="toast" class="toast">IP скопирован</div>
 
     <script>
         let registered = false;
@@ -369,30 +478,114 @@ HTML = f'''<!DOCTYPE html>
         let nickname = '';
         let heartbeatInterval = null;
         let currentUserIp = null;
+        let allUsers = [];
+        let currentSuggestionIndex = -1;
+        let currentSuggestions = [];
+        let isSending = false;
+        let reloadTimer = null;
+        let lastActivityTime = Date.now();
 
-        function showToast(message) {{
+        let NO_ACTIVE_MODE = {'true' if NO_ACTIVE else 'false'};
+        let ADMIN_MODE_ACTIVE = {'true' if ADMIN_MODE else 'false'};
+        let SERVER_IP_ADDR = '{SERVER_IP}';
+
+        function resetReloadTimer() {{
+            if (reloadTimer) {{
+                clearTimeout(reloadTimer);
+            }}
+            reloadTimer = setTimeout(() => {{
+                const messageInput = document.getElementById('messageInput');
+                if (messageInput && messageInput.value.trim() === '') {{
+                    location.reload();
+                }} else {{
+                    resetReloadTimer();
+                }}
+            }}, 30000);
+        }}
+
+        function showToast() {{
             const toast = document.getElementById('toast');
-            toast.textContent = message;
             toast.classList.add('show');
             setTimeout(() => {{
                 toast.classList.remove('show');
-            }}, 2000);
+            }}, 550);
         }}
 
         function copyToClipboard(text) {{
-            navigator.clipboard.writeText(text).then(() => {{
-                showToast('IP скопирован: ' + text);
-            }}).catch(() => {{
-                showToast('Не удалось скопировать');
-            }});
+            navigator.clipboard.writeText(text);
+            showToast();
         }}
 
+        function trackActivity() {{
+            lastActivityTime = Date.now();
+        }}
+        document.addEventListener('keydown', trackActivity);
+        document.addEventListener('mousedown', trackActivity);
+        document.addEventListener('input', trackActivity);
+
+        resetReloadTimer();
+
+        const rightPanel = document.getElementById('rightPanel');
+        let isResizing = false;
+        let startX, startWidth;
+        
+        if (rightPanel && !NO_ACTIVE_MODE) {{
+            rightPanel.addEventListener('mousedown', (e) => {{
+                if (e.target.classList.contains('resize-handle') || e.target === rightPanel) {{
+                    isResizing = true;
+                    startX = e.clientX;
+                    startWidth = rightPanel.offsetWidth;
+                    document.body.style.cursor = 'ew-resize';
+                    e.preventDefault();
+                }}
+            }});
+        }}
+        
+        document.addEventListener('mousemove', (e) => {{
+            if (!isResizing) return;
+            const newWidth = startWidth + (startX - e.clientX);
+            if (newWidth >= 100 && newWidth <= 350) {{
+                rightPanel.style.width = newWidth + 'px';
+            }}
+        }});
+        
+        document.addEventListener('mouseup', () => {{
+            isResizing = false;
+            document.body.style.cursor = '';
+        }});
+
+        const panel = document.getElementById('panel');
+        let isResizingPanel = false;
+        let startY, startHeight;
+        
+        panel.addEventListener('mousedown', (e) => {{
+            if (e.target.classList.contains('resize-handle')) {{
+                isResizingPanel = true;
+                startY = e.clientY;
+                startHeight = panel.offsetHeight;
+                document.body.style.cursor = 'ns-resize';
+                e.preventDefault();
+            }}
+        }});
+        
+        document.addEventListener('mousemove', (e) => {{
+            if (!isResizingPanel) return;
+            const newHeight = startHeight + (startY - e.clientY);
+            if (newHeight >= 100 && newHeight <= 400) {{
+                panel.style.height = newHeight + 'px';
+            }}
+        }});
+        
+        document.addEventListener('mouseup', () => {{
+            isResizingPanel = false;
+            document.body.style.cursor = '';
+        }});
+
         const hostMenuContainer = document.getElementById('hostMenuContainer');
-        // Хост-меню видно только если текущий IP равен SERVER_IP
         fetch('/api/get_my_ip')
             .then(res => res.json())
             .then(data => {{
-                if (data.ip === '{SERVER_IP}') {{
+                if (data.ip === SERVER_IP_ADDR) {{
                     if (hostMenuContainer) hostMenuContainer.style.display = 'block';
                 }}
             }});
@@ -460,8 +653,16 @@ HTML = f'''<!DOCTYPE html>
             }});
         }}
 
+        document.getElementById('cmdTell')?.addEventListener('click', () => {{
+            const nick = prompt('Введите ник получателя (без @):');
+            if (!nick) return;
+            const message = prompt('Введите сообщение:');
+            if (message) sendCommand('/tell @' + nick + ' "' + message + '"');
+        }});
+
         function startHeartbeat() {{
             if (heartbeatInterval) clearInterval(heartbeatInterval);
+            if (NO_ACTIVE_MODE) return;
             heartbeatInterval = setInterval(() => {{
                 if (registered && nickname) {{
                     fetch('/api/heartbeat', {{
@@ -474,25 +675,28 @@ HTML = f'''<!DOCTYPE html>
         }}
 
         function loadActiveUsers() {{
+            if (NO_ACTIVE_MODE) return;
             fetch('/api/active_users')
                 .then(res => res.json())
                 .then(users => {{
+                    allUsers = users.filter(u => u.nickname !== nickname);
                     const container = document.getElementById('activeUsersList');
                     if (!container) return;
                     if (users.length === 0) {{
-                        container.innerHTML = '<div class="active-user offline">Нет активных</div>';
+                        container.innerHTML = '<div class="active-user">Нет активных</div>';
                         return;
                     }}
                     let html = '';
                     users.forEach(user => {{
-                        html += `<div class="active-user online" data-ip="${{user.ip}}">${{escapeHtml(user.nickname)}}</div>`;
+                        const adminBadge = user.isAdmin ? '<span class="active-user-badge">A</span>' : '';
+                        html += `<div class="active-user" data-ip="${{user.ip}}" data-nickname="${{escapeHtml(user.nickname)}}">${{adminBadge}}${{escapeHtml(user.nickname)}}</div>`;
                     }});
                     container.innerHTML = html;
                     document.querySelectorAll('.active-user').forEach(el => {{
                         el.addEventListener('click', (e) => {{
                             e.stopPropagation();
                             const ip = el.dataset.ip;
-                            if (ip) copyToClipboard(ip);
+                            if (ip && isAdmin) copyToClipboard(ip);
                         }});
                     }});
                 }})
@@ -507,6 +711,17 @@ HTML = f'''<!DOCTYPE html>
         function restoreScrollPosition() {{
             const chat = document.getElementById('chat');
             chat.scrollTop = scrollPosition;
+        }}
+
+        function highlightMentions(text, currentNickname) {{
+            if (!text) return text;
+            const regex = /@(\\w+)/g;
+            return text.replace(regex, (match, mentionNick) => {{
+                if (mentionNick === currentNickname) {{
+                    return `<span class="mention-highlight">${{match}}</span>`;
+                }}
+                return match;
+            }});
         }}
 
         function showWarning(message, isError = true) {{
@@ -536,6 +751,107 @@ HTML = f'''<!DOCTYPE html>
             }}
         }}
 
+        function updateSuggestions(query) {{
+            const filtered = allUsers.filter(user => 
+                user.nickname.toLowerCase().startsWith(query.toLowerCase())
+            ).slice(0, 5);
+            currentSuggestions = filtered;
+            const suggestionsBox = document.getElementById('suggestions');
+            
+            if (filtered.length > 0) {{
+                suggestionsBox.innerHTML = '';
+                filtered.forEach((user, index) => {{
+                    const div = document.createElement('div');
+                    div.className = 'suggestion-item' + (index === currentSuggestionIndex ? ' selected' : '');
+                    div.innerHTML = `<span>@${{escapeHtml(user.nickname)}}</span>`;
+                    div.addEventListener('click', () => {{
+                        insertSuggestion(user.nickname);
+                    }});
+                    suggestionsBox.appendChild(div);
+                }});
+                suggestionsBox.style.display = 'block';
+            }} else {{
+                suggestionsBox.style.display = 'none';
+                currentSuggestionIndex = -1;
+            }}
+        }}
+
+        function insertSuggestion(nicknameValue) {{
+            const input = document.getElementById('messageInput');
+            const value = input.value;
+            const cursorPos = input.selectionStart;
+            const textBeforeCursor = value.substring(0, cursorPos);
+            const lastAtIndex = textBeforeCursor.lastIndexOf('@');
+            if (lastAtIndex !== -1) {{
+                const newValue = value.substring(0, lastAtIndex) + '@' + nicknameValue + ' ' + value.substring(cursorPos);
+                input.value = newValue;
+                document.getElementById('suggestions').style.display = 'none';
+                currentSuggestionIndex = -1;
+                input.focus();
+                updateCharCounter();
+            }}
+        }}
+
+        const messageInput = document.getElementById('messageInput');
+        const suggestionsBox = document.getElementById('suggestions');
+        
+        messageInput.addEventListener('input', function() {{
+            const value = messageInput.value;
+            const cursorPos = messageInput.selectionStart;
+            const textBeforeCursor = value.substring(0, cursorPos);
+            const lastAtIndex = textBeforeCursor.lastIndexOf('@');
+            
+            if (lastAtIndex !== -1) {{
+                const query = textBeforeCursor.substring(lastAtIndex + 1);
+                if (!query.includes(' ')) {{
+                    updateSuggestions(query);
+                }} else {{
+                    suggestionsBox.style.display = 'none';
+                    currentSuggestionIndex = -1;
+                }}
+            }} else {{
+                suggestionsBox.style.display = 'none';
+                currentSuggestionIndex = -1;
+            }}
+        }});
+
+        messageInput.addEventListener('keydown', function(e) {{
+            if (suggestionsBox.style.display === 'block') {{
+                if (e.key === 'Tab') {{
+                    e.preventDefault();
+                    if (currentSuggestions.length > 0) {{
+                        currentSuggestionIndex = (currentSuggestionIndex + 1) % currentSuggestions.length;
+                        const items = suggestionsBox.querySelectorAll('.suggestion-item');
+                        items.forEach((item, idx) => {{
+                            if (idx === currentSuggestionIndex) {{
+                                item.classList.add('selected');
+                            }} else {{
+                                item.classList.remove('selected');
+                            }}
+                        }});
+                    }}
+                }} else if (e.key === 'Enter') {{
+                    e.preventDefault();
+                    if (currentSuggestionIndex >= 0 && currentSuggestions[currentSuggestionIndex]) {{
+                        insertSuggestion(currentSuggestions[currentSuggestionIndex].nickname);
+                        return;
+                    }}
+                }}
+            }}
+            if (!registered) return;
+            if (e.key === 'Enter' && !e.shiftKey && suggestionsBox.style.display !== 'block') {{
+                e.preventDefault();
+                sendMessage();
+            }}
+        }});
+
+        document.addEventListener('click', function(e) {{
+            if (suggestionsBox && !suggestionsBox.contains(e.target) && e.target !== messageInput) {{
+                suggestionsBox.style.display = 'none';
+                currentSuggestionIndex = -1;
+            }}
+        }});
+
         function loadMessages() {{
             saveScrollPosition();
             fetch('/api/messages')
@@ -547,29 +863,28 @@ HTML = f'''<!DOCTYPE html>
                     messages.forEach(msg => {{
                         const div = document.createElement('div');
                         div.className = 'msg';
+                        if (msg.isOwn) {{
+                            div.classList.add('own-message');
+                        }}
+                        if (msg.hasMention) {{
+                            div.classList.add('mention');
+                        }}
+                        if (msg.isCommand) {{
+                            div.classList.add('command-message');
+                        }}
+                        if (msg.isWhisper) {{
+                            div.classList.add('whisper');
+                        }}
                         let ipHtml = '';
-                        if ({ADMIN_MODE_STR} && msg.ip) {{
-                            ipHtml = `<span class="ip" data-ip="${{escapeHtml(msg.ip)}}">(${{escapeHtml(msg.ip)}})</span>`;
+                        if (ADMIN_MODE_ACTIVE && msg.showIp && msg.ip) {{
+                            ipHtml = `<span class="ip">(${{escapeHtml(msg.ip)}})</span>`;
                         }}
                         const nicknameColor = msg.nicknameColor || '#B8860B';
-                        div.innerHTML = `<span class="time">[${{escapeHtml(msg.time)}}]</span>${{ipHtml}} <span class="nickname" style="color: ${{nicknameColor}};" data-ip="${{msg.ip || ''}}">${{escapeHtml(msg.nickname)}}:</span> <span class="text">${{escapeHtml(msg.text)}}</span>`;
+                        const adminBadge = msg.isAdmin ? '<span class="admin-badge-inline">A</span>' : '';
+                        const whisperLabel = msg.isWhisper ? '<span class="whisper-label">[Шёпот]</span>' : '';
+                        const highlightedText = highlightMentions(escapeHtml(msg.text), nickname);
+                        div.innerHTML = `<span class="time">[${{escapeHtml(msg.time)}}]</span>${{ipHtml}} ${{whisperLabel}}<span class="nickname" style="color: ${{nicknameColor}};">${{escapeHtml(msg.nickname)}}${{adminBadge}}:</span> <span class="text">${{highlightedText}}</span>`;
                         chat.appendChild(div);
-                    }});
-                    document.querySelectorAll('.nickname').forEach(el => {{
-                        el.addEventListener('click', (e) => {{
-                            e.stopPropagation();
-                            const ip = el.dataset.ip;
-                            if (ip && {ADMIN_MODE_STR}) {{
-                                copyToClipboard(ip);
-                            }}
-                        }});
-                    }});
-                    document.querySelectorAll('.ip').forEach(el => {{
-                        el.addEventListener('click', (e) => {{
-                            e.stopPropagation();
-                            const ip = el.dataset.ip;
-                            if (ip) copyToClipboard(ip);
-                        }});
                     }});
                     if (wasScrolledToBottom) {{
                         chat.scrollTop = chat.scrollHeight;
@@ -617,7 +932,11 @@ HTML = f'''<!DOCTYPE html>
             }});
         }}
 
-        function sendMessage() {{
+        async function sendMessage() {{
+            if (isSending) {{
+                showWarning('Подождите, сообщение уже отправляется...', true);
+                return;
+            }}
             const input = document.getElementById('messageInput');
             const text = input.value.trim();
             if (!text || !registered) return;
@@ -627,19 +946,35 @@ HTML = f'''<!DOCTYPE html>
                 return;
             }}
             
-            fetch('/api/send', {{
-                method: 'POST',
-                headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
-                body: 'text=' + encodeURIComponent(text)
-            }}).then(res => res.json()).then(data => {{
+            isSending = true;
+            const sendBtn = document.getElementById('sendBtn');
+            sendBtn.disabled = true;
+            sendBtn.textContent = 'Отправка...';
+            
+            try {{
+                const response = await fetch('/api/send', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+                    body: 'text=' + encodeURIComponent(text)
+                }});
+                const data = await response.json();
                 if (data.success) {{
                     input.value = '';
                     updateCharCounter();
+                    suggestionsBox.style.display = 'none';
+                    currentSuggestionIndex = -1;
                     loadMessages();
                 }} else if (data.error) {{
                     showWarning(data.error, true);
                 }}
-            }}).catch(e => console.log('Ошибка отправки:', e));
+            }} catch (e) {{
+                console.log('Ошибка отправки:', e);
+                showWarning('Ошибка отправки. Попробуйте ещё раз.', true);
+            }} finally {{
+                isSending = false;
+                sendBtn.disabled = false;
+                sendBtn.textContent = 'Отправить';
+            }}
         }}
 
         function registerNickname() {{
@@ -691,18 +1026,13 @@ HTML = f'''<!DOCTYPE html>
 
         const msgInput = document.getElementById('messageInput');
         msgInput.addEventListener('input', updateCharCounter);
-        msgInput.addEventListener('keydown', function(e) {{
-            if (!registered) return;
-            if (e.key === 'Enter' && !e.shiftKey) {{
-                e.preventDefault();
-                sendMessage();
-            }}
-        }});
 
         document.getElementById('sendBtn').addEventListener('click', sendMessage);
 
         setInterval(loadMessages, {REFRESH_INTERVAL});
-        setInterval(loadActiveUsers, 5000);
+        if (!NO_ACTIVE_MODE) {{
+            setInterval(loadActiveUsers, 5000);
+        }}
         checkRegistration();
         loadMessages();
         updateCharCounter();
@@ -711,7 +1041,7 @@ HTML = f'''<!DOCTYPE html>
 </html>'''
 
 class MessengerHandler(BaseHTTPRequestHandler):
-    def send_system_message(self, text):
+    def add_command_message(self, nickname, text):
         if not SHOW_COMMANDS:
             return
         try:
@@ -726,10 +1056,44 @@ class MessengerHandler(BaseHTTPRequestHandler):
         
         messages.append({
             'time': datetime.now().strftime('%H:%M:%S'),
-            'nickname': 'СИСТЕМА',
+            'nickname': nickname,
             'text': text,
             'ip': '0.0.0.0',
-            'nicknameColor': '#888'
+            'nicknameColor': '#888',
+            'isAdmin': True,
+            'isCommand': True
+        })
+        
+        if len(messages) > SAVE_LIMIT:
+            messages = messages[-SAVE_LIMIT:]
+        
+        with open(MESSAGES_FILE, 'w') as f:
+            json.dump(messages, f)
+
+    def add_whisper_message(self, from_nickname, to_nickname, to_ip, text, from_ip):
+        try:
+            with open(MESSAGES_FILE, 'r') as f:
+                content = f.read().strip()
+                if not content:
+                    messages = []
+                else:
+                    messages = json.loads(content)
+        except (json.JSONDecodeError, IOError):
+            messages = []
+        
+        from_color = get_nickname_color(from_ip)
+        
+        whisper_text = f"→ {to_nickname}: {text}"
+        
+        messages.append({
+            'time': datetime.now().strftime('%H:%M:%S'),
+            'nickname': from_nickname,
+            'text': whisper_text,
+            'ip': from_ip,
+            'nicknameColor': from_color,
+            'isAdmin': is_admin(from_ip),
+            'isWhisper': True,
+            'whisperTarget': to_nickname
         })
         
         if len(messages) > SAVE_LIMIT:
@@ -747,7 +1111,26 @@ class MessengerHandler(BaseHTTPRequestHandler):
         elif self.path == '/api/get_my_ip':
             client_ip = self.client_address[0]
             self._send_json({'ip': client_ip})
+        elif self.path == '/api/active_users':
+            if NO_ACTIVE:
+                self._send_json([])
+                return
+            with active_users_lock:
+                users_copy = []
+                for ip, data in active_users.items():
+                    users_copy.append({
+                        'nickname': data.get('nickname', 'Unknown'),
+                        'ip': ip,
+                        'isAdmin': is_admin(ip)
+                    })
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(users_copy).encode())
         elif self.path == '/api/messages':
+            client_ip = self.client_address[0]
+            is_host = (client_ip == SERVER_IP)
+            client_nickname = get_nickname(client_ip)
             try:
                 with open(MESSAGES_FILE, 'r') as f:
                     content = f.read().strip()
@@ -755,31 +1138,41 @@ class MessengerHandler(BaseHTTPRequestHandler):
                         messages = []
                     else:
                         messages = json.loads(content)
+                
+                processed_messages = []
+                for msg in messages[-DISPLAY_LIMIT:]:
+                    msg_copy = msg.copy()
+                    
+                    # Фильтрация шёпотов: только отправитель, получатель или хост
+                    if msg_copy.get('isWhisper'):
+                        target = msg_copy.get('whisperTarget')
+                        is_sender = (msg_copy.get('ip') == client_ip)
+                        is_target = (target == client_nickname)
+                        is_server_host = is_host
+                        
+                        if not (is_sender or is_target or is_server_host):
+                            continue
+                    
+                    msg_copy['isOwn'] = (msg_copy.get('ip') == client_ip)
+                    msg_copy['hasMention'] = (f'@{get_nickname(client_ip)}' in msg_copy.get('text', ''))
+                    msg_copy['isAdmin'] = is_admin(msg_copy.get('ip', '0.0.0.0'))
+                    msg_copy['showIp'] = is_host
+                    
+                    if not ADMIN_MODE:
+                        msg_copy.pop('ip', None)
+                    
+                    processed_messages.append(msg_copy)
+                
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
-                if ADMIN_MODE:
-                    self.wfile.write(json.dumps(messages[-DISPLAY_LIMIT:]).encode())
-                else:
-                    messages_without_ip = []
-                    for msg in messages[-DISPLAY_LIMIT:]:
-                        msg_copy = msg.copy()
-                        msg_copy.pop('ip', None)
-                        messages_without_ip.append(msg_copy)
-                    self.wfile.write(json.dumps(messages_without_ip).encode())
+                self.wfile.write(json.dumps(processed_messages).encode())
             except (json.JSONDecodeError, IOError):
                 messages = []
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
-                self.wfile.write(json.dumps(messages).encode())
-        elif self.path == '/api/active_users':
-            with active_users_lock:
-                users_copy = list(active_users.values())
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(users_copy).encode())
+                self.wfile.write(json.dumps([]).encode())
         elif self.path == '/api/check':
             client_ip = self.client_address[0]
             try:
@@ -808,6 +1201,9 @@ class MessengerHandler(BaseHTTPRequestHandler):
         params = parse_qs(body)
         
         if self.path == '/api/heartbeat':
+            if NO_ACTIVE:
+                self._send_json({'success': True})
+                return
             nickname = params.get('nickname', ['Unknown'])[0].strip()
             with active_users_lock:
                 active_users[client_ip] = {'nickname': nickname, 'ip': client_ip, 'last_seen': datetime.now().timestamp()}
@@ -859,9 +1255,53 @@ class MessengerHandler(BaseHTTPRequestHandler):
                 self._send_json({'success': False, 'error': f'Сообщение слишком длинное! Максимум {MAX_MESSAGE_LENGTH} символов'})
                 return
             
+            current_time = time.time()
+            with last_message_lock:
+                last_key = f"{client_ip}:{text}"
+                if last_key in last_message_cache:
+                    last_time = last_message_cache[last_key]
+                    if current_time - last_time < 2:
+                        self._send_json({'success': False, 'error': 'Вы слишком быстро отправляете сообщения'})
+                        return
+                last_message_cache[last_key] = current_time
+                keys_to_remove = [k for k, v in last_message_cache.items() if current_time - v > 5]
+                for k in keys_to_remove:
+                    del last_message_cache[k]
+            
+            # Обработка команды /tell
+            if text.startswith('/tell'):
+                match = re.match(r'^/tell\s+@?(\w+)\s+"(.+)"$', text)
+                if not match:
+                    match = re.match(r"^/tell\s+@?(\w+)\s+'(.+)'$", text)
+                if match:
+                    target_nickname = match.group(1)
+                    whisper_text = match.group(2)
+                    sender_nickname = get_nickname(client_ip)
+                    
+                    target_ip = get_ip_by_nickname(target_nickname)
+                    if target_ip is None:
+                        self._send_json({'success': False, 'error': f'Пользователь @{target_nickname} не найден'})
+                        return
+                    
+                    if target_ip == client_ip:
+                        self._send_json({'success': False, 'error': 'Нельзя отправить шёпот самому себе'})
+                        return
+                    
+                    self.add_whisper_message(sender_nickname, target_nickname, target_ip, whisper_text, client_ip)
+                    
+                    if SHOW_COMMANDS:
+                        self.add_command_message(sender_nickname, text)
+                    
+                    self._send_json({'success': True})
+                    return
+                else:
+                    self._send_json({'success': False, 'error': 'Неверный формат. Используйте: /tell @ник "сообщение"'})
+                    return
+            
             if is_admin(client_ip) and text.startswith('/'):
                 parts = text.split()
                 cmd = parts[0].lower()
+                sender_nickname = get_nickname(client_ip)
                 
                 if cmd == '/a' and len(parts) == 2:
                     target_ip = parts[1]
@@ -873,11 +1313,11 @@ class MessengerHandler(BaseHTTPRequestHandler):
                         else:
                             users[target_ip] = {'nickname': user_data, 'is_admin': True}
                         save_users(users)
-                        self.send_system_message(f'Администратор {get_nickname(client_ip)} добавил админа {target_ip}')
                     else:
                         users[target_ip] = {'nickname': 'Unknown', 'is_admin': True}
                         save_users(users)
-                        self.send_system_message(f'Администратор {get_nickname(client_ip)} добавил админа {target_ip}')
+                    if SHOW_COMMANDS:
+                        self.add_command_message(sender_nickname, text)
                     self._send_json({'success': True})
                     return
                 
@@ -889,7 +1329,8 @@ class MessengerHandler(BaseHTTPRequestHandler):
                             json.dump(current_messages, f, ensure_ascii=False, indent=2)
                         with open(MESSAGES_FILE, 'w') as f:
                             json.dump([], f)
-                        self.send_system_message(f'Администратор {get_nickname(client_ip)} очистил чат')
+                        if SHOW_COMMANDS:
+                            self.add_command_message(sender_nickname, text)
                         self._send_json({'success': True})
                     except Exception as e:
                         self._send_json({'success': False, 'error': f'Ошибка: {e}'})
@@ -914,8 +1355,8 @@ class MessengerHandler(BaseHTTPRequestHandler):
                         
                         with open(MESSAGES_FILE, 'w') as f:
                             json.dump(combined, f)
-                        
-                        self.send_system_message(f'Администратор {get_nickname(client_ip)} восстановил чат из бэкапа')
+                        if SHOW_COMMANDS:
+                            self.add_command_message(sender_nickname, text)
                         self._send_json({'success': True})
                     except Exception as e:
                         self._send_json({'success': False, 'error': f'Ошибка: {e}'})
@@ -944,7 +1385,8 @@ class MessengerHandler(BaseHTTPRequestHandler):
                         users[target_ip] = {'nickname': new_nickname, 'is_admin': old_is_admin}
                     
                     save_users(users)
-                    self.send_system_message(f'Администратор {get_nickname(client_ip)} сменил ник {target_ip} с "{old_nickname}" на "{new_nickname}"')
+                    if SHOW_COMMANDS:
+                        self.add_command_message(sender_nickname, text)
                     self._send_json({'success': True})
                     return
                 
@@ -969,7 +1411,8 @@ class MessengerHandler(BaseHTTPRequestHandler):
                 'nickname': get_nickname(client_ip),
                 'text': text,
                 'ip': client_ip,
-                'nicknameColor': nickname_color
+                'nicknameColor': nickname_color,
+                'isAdmin': is_admin(client_ip)
             })
             
             if len(messages) > SAVE_LIMIT:
@@ -984,12 +1427,17 @@ class MessengerHandler(BaseHTTPRequestHandler):
             self.end_headers()
     
     def _send_json(self, data):
-        self.send_response(200)
-        self.send_header('Content-type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        try:
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
+        except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
+            pass
 
 def cleanup_active_users():
+    if NO_ACTIVE:
+        return
     import time
     while True:
         time.sleep(30)
@@ -1000,8 +1448,9 @@ def cleanup_active_users():
                 del active_users[ip]
 
 def run_server():
-    cleanup_thread = threading.Thread(target=cleanup_active_users, daemon=True)
-    cleanup_thread.start()
+    if not NO_ACTIVE:
+        cleanup_thread = threading.Thread(target=cleanup_active_users, daemon=True)
+        cleanup_thread.start()
     
     print(f'Мессенджер запущен на http://localhost:8000')
     print(f'  - http://{SERVER_IP}:8000')
@@ -1012,8 +1461,9 @@ def run_server():
     print(f'Интервал обновления чата: {REFRESH_INTERVAL} мс')
     print(f'При нажатии + или = (не в полях ввода) переход на: {REDIRECT_URL}')
     print(f'Показывать команды в чате: {"Да" if SHOW_COMMANDS else "Нет"}')
+    print(f'Система активных пользователей: {"Выключена" if NO_ACTIVE else "Включена"}')
     if ADMIN_MODE:
-        print(f'РЕЖИМ АДМИНА: Включён (IP сервера: {SERVER_IP})')
+        print(f'РЕЖИМ АДМИНА: Включён (только хост видит IP)')
     else:
         print(f'РЕЖИМ АДМИНА: Выключен')
     HTTPServer(('', 8000), MessengerHandler).serve_forever()

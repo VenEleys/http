@@ -12,7 +12,6 @@ import re
 # Папка для хранения данных
 DATA_DIR = 'db'
 
-# Создаём папку db, если её нет
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
@@ -21,8 +20,8 @@ USERS_FILE = os.path.join(DATA_DIR, 'users.json')
 BACKUP_FILE = os.path.join(DATA_DIR, 'back.json')
 
 SAVE_LIMIT = 1000
-DISPLAY_LIMIT = 50
-MAX_MESSAGE_LENGTH = 500
+DISPLAY_LIMIT = 75
+MAX_MESSAGE_LENGTH = 1000
 PAGE_TITLE = "HTTP"
 
 REDIRECT_URL = "https://www.google.com"
@@ -112,6 +111,23 @@ def set_nickname(ip, nickname):
         users[ip] = {'nickname': nickname, 'is_admin': False}
     save_users(users)
 
+def update_nickname_in_messages(old_nickname, new_nickname):
+    try:
+        with open(MESSAGES_FILE, 'r') as f:
+            messages = json.load(f)
+        
+        updated = False
+        for msg in messages:
+            if msg.get('nickname') == old_nickname:
+                msg['nickname'] = new_nickname
+                updated = True
+        
+        if updated:
+            with open(MESSAGES_FILE, 'w') as f:
+                json.dump(messages, f)
+    except (json.JSONDecodeError, IOError):
+        pass
+
 def get_nickname_color(ip):
     hash_val = 0
     for c in ip:
@@ -154,6 +170,7 @@ HTML = f'''<!DOCTYPE html>
             border-radius: 4px;
             border: 1px solid #e0c080;
             box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+            position: relative;
         }}
         .msg:hover {{ background: #fff3e0; }}
         .msg.own-message {{
@@ -173,8 +190,14 @@ HTML = f'''<!DOCTYPE html>
             background: #e8e0f0;
             border-left: 3px solid #9b59b6;
         }}
+        .msg.deleted-for-host {{
+            background: #d0d0d0 !important;
+            border: 1px dashed #666;
+            opacity: 0.8;
+        }}
         .time {{ color: #8B6914; font-size: 12px; font-weight: 500; }}
-        .ip {{ color: #888; font-size: 10px; margin-left: 5px; }}
+        .ip {{ color: #888; font-size: 10px; margin-left: 5px; cursor: pointer; }}
+        .ip:hover {{ text-decoration: underline; }}
         .nickname {{ font-weight: bold; }}
         .text {{ color: #333; white-space: pre-wrap; }}
         .whisper-label {{
@@ -199,6 +222,47 @@ HTML = f'''<!DOCTYPE html>
             border-radius: 10px;
             margin-left: 6px;
             display: inline-block;
+        }}
+        .msg-actions {{
+            position: absolute;
+            right: 8px;
+            top: 8px;
+            display: none;
+            gap: 5px;
+        }}
+        .msg:hover .msg-actions {{
+            display: flex;
+        }}
+        .action-btn {{
+            background: #3c3c3c;
+            border: none;
+            color: #d4d4d4;
+            cursor: pointer;
+            font-size: 11px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: monospace;
+        }}
+        .action-btn:hover {{
+            background: #555;
+        }}
+        .copy-btn {{
+            background: #0e639c;
+        }}
+        .copy-btn:hover {{
+            background: #1177bb;
+        }}
+        .delete-btn {{
+            background: #8B0000;
+        }}
+        .delete-btn:hover {{
+            background: #a00000;
+        }}
+        .restore-btn {{
+            background: #0e639c;
+        }}
+        .restore-btn:hover {{
+            background: #1177bb;
         }}
         .panel {{
             background: #3c3c3c;
@@ -425,13 +489,14 @@ HTML = f'''<!DOCTYPE html>
                     <div class="menu-item" id="cmdRestore"><strong>/ret</strong> — Восстановить чат из back.json</div>
                     <div class="menu-item" id="cmdAddAdmin"><strong>/a "ip"</strong> — Сделать пользователя администратором</div>
                     <div class="menu-item" id="cmdChangeNick"><strong>/ch "ip" "ник"</strong> — Сменить ник пользователю</div>
+                    <div class="menu-item" id="cmdChangeNickAll"><strong>/ch-u "ip" "новый_ник"</strong> — Сменить ник и обновить в сообщениях</div>
                 </div>
             </div>
             <div class="tools-menu">
                 <button class="menu-btn" id="menuBtn">Инструменты</button>
                 <div class="menu-content" id="menuContent">
                     <div class="menu-item"><strong>+ / =</strong> — Нажмите + или =, чтобы закрыть сайт (не работает при вводе текста)</div>
-                    <div class="menu-item" id="cmdTell"><strong>/tell @ник "сообщение"</strong> — Отправить личное сообщение (Шёпот)</div>
+                    <div class="menu-item" id="cmdTell"><strong>/tell @ник сообщение</strong> — Отправить личное сообщение (Шёпот)</div>
                 </div>
             </div>
         </div>
@@ -469,7 +534,7 @@ HTML = f'''<!DOCTYPE html>
             <div class="resize-handle">⋮</div>
         </div>
     </div>
-    <div id="toast" class="toast">IP скопирован</div>
+    <div id="toast" class="toast">Скопировано!</div>
 
     <script>
         let registered = false;
@@ -503,17 +568,73 @@ HTML = f'''<!DOCTYPE html>
             }}, 30000);
         }}
 
-        function showToast() {{
+        function showToast(message) {{
             const toast = document.getElementById('toast');
+            toast.textContent = message || 'Скопировано!';
             toast.classList.add('show');
             setTimeout(() => {{
                 toast.classList.remove('show');
             }}, 550);
         }}
 
+        function fallbackCopy(text) {{
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            textarea.style.position = 'fixed';
+            textarea.style.top = '-9999px';
+            textarea.style.left = '-9999px';
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textarea);
+        }}
+
         function copyToClipboard(text) {{
-            navigator.clipboard.writeText(text);
-            showToast();
+            if (navigator.clipboard && navigator.clipboard.writeText) {{
+                navigator.clipboard.writeText(text).then(() => {{
+                    showToast('Скопировано!');
+                }}).catch(() => {{
+                    fallbackCopy(text);
+                    showToast('Скопировано!');
+                }});
+            }} else {{
+                fallbackCopy(text);
+                showToast('Скопировано!');
+            }}
+        }}
+
+        function copyMessage(text) {{
+            if (navigator.clipboard && navigator.clipboard.writeText) {{
+                navigator.clipboard.writeText(text).then(() => {{
+                    showToast('Сообщение скопировано!');
+                }}).catch(() => {{
+                    fallbackCopy(text);
+                    showToast('Сообщение скопировано!');
+                }});
+            }} else {{
+                fallbackCopy(text);
+                showToast('Сообщение скопировано!');
+            }}
+        }}
+
+        function deleteMessage(msgId, isHard) {{
+            fetch('/api/delete_message', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+                body: 'msg_id=' + encodeURIComponent(msgId) + '&hard=' + encodeURIComponent(isHard)
+            }}).then(() => {{
+                loadMessages();
+            }}).catch(e => console.log('Ошибка удаления:', e));
+        }}
+
+        function restoreMessage(msgId) {{
+            fetch('/api/restore_message', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+                body: 'msg_id=' + encodeURIComponent(msgId)
+            }}).then(() => {{
+                loadMessages();
+            }}).catch(e => console.log('Ошибка восстановления:', e));
         }}
 
         function trackActivity() {{
@@ -651,13 +772,19 @@ HTML = f'''<!DOCTYPE html>
                 const newNick = prompt('Введите новый ник:');
                 if (newNick) sendCommand('/ch ' + ip + ' ' + newNick);
             }});
+            document.getElementById('cmdChangeNickAll')?.addEventListener('click', () => {{
+                const ip = prompt('Введите IP пользователя:');
+                if (!ip) return;
+                const newNick = prompt('Введите новый ник:');
+                if (newNick) sendCommand('/ch-u ' + ip + ' ' + newNick);
+            }});
         }}
 
         document.getElementById('cmdTell')?.addEventListener('click', () => {{
             const nick = prompt('Введите ник получателя (без @):');
             if (!nick) return;
             const message = prompt('Введите сообщение:');
-            if (message) sendCommand('/tell @' + nick + ' "' + message + '"');
+            if (message) sendCommand('/tell @' + nick + ' ' + message);
         }});
 
         function startHeartbeat() {{
@@ -860,6 +987,7 @@ HTML = f'''<!DOCTYPE html>
                     const chat = document.getElementById('chat');
                     const wasScrolledToBottom = (chat.scrollHeight - chat.scrollTop - chat.clientHeight) < 10;
                     chat.innerHTML = '';
+                    const isHost = (currentUserIp === SERVER_IP_ADDR);
                     messages.forEach(msg => {{
                         const div = document.createElement('div');
                         div.className = 'msg';
@@ -875,17 +1003,72 @@ HTML = f'''<!DOCTYPE html>
                         if (msg.isWhisper) {{
                             div.classList.add('whisper');
                         }}
+                        if (msg.isDeleted && isHost) {{
+                            div.classList.add('deleted-for-host');
+                        }}
                         let ipHtml = '';
                         if (ADMIN_MODE_ACTIVE && msg.showIp && msg.ip) {{
-                            ipHtml = `<span class="ip">(${{escapeHtml(msg.ip)}})</span>`;
+                            ipHtml = `<span class="ip" data-ip="${{escapeHtml(msg.ip)}}">(${{escapeHtml(msg.ip)}})</span>`;
                         }}
                         const nicknameColor = msg.nicknameColor || '#B8860B';
                         const adminBadge = msg.isAdmin ? '<span class="admin-badge-inline">A</span>' : '';
                         const whisperLabel = msg.isWhisper ? '<span class="whisper-label">[Шёпот]</span>' : '';
                         const highlightedText = highlightMentions(escapeHtml(msg.text), nickname);
-                        div.innerHTML = `<span class="time">[${{escapeHtml(msg.time)}}]</span>${{ipHtml}} ${{whisperLabel}}<span class="nickname" style="color: ${{nicknameColor}};">${{escapeHtml(msg.nickname)}}${{adminBadge}}:</span> <span class="text">${{highlightedText}}</span>`;
+                        
+                        let actionsHtml = `<div class="msg-actions">
+                            <button class="action-btn copy-btn" data-text="${{escapeHtml(msg.originalText || msg.text)}}">📋</button>`;
+                        
+                        if (msg.isDeleted && isHost) {{
+                            actionsHtml += `<button class="action-btn restore-btn" data-id="${{msg.id}}">↩️</button>`;
+                            actionsHtml += `<button class="action-btn delete-btn" data-id="${{msg.id}}" data-hard="true">🗑</button>`;
+                        }} else if (msg.isOwn && !msg.isDeleted) {{
+                            actionsHtml += `<button class="action-btn delete-btn" data-id="${{msg.id}}" data-hard="false">🗑</button>`;
+                        }} else if (isAdmin && !msg.isDeleted) {{
+                            actionsHtml += `<button class="action-btn delete-btn" data-id="${{msg.id}}" data-hard="false">🗑</button>`;
+                        }}
+                        actionsHtml += `</div>`;
+                        
+                        div.innerHTML = `<span class="time">[${{escapeHtml(msg.time)}}]</span>${{ipHtml}} ${{whisperLabel}}<span class="nickname" style="color: ${{nicknameColor}};">${{escapeHtml(msg.nickname)}}${{adminBadge}}:</span> <span class="text">${{highlightedText}}</span>${{actionsHtml}}`;
                         chat.appendChild(div);
                     }});
+                    
+                    document.querySelectorAll('.copy-btn').forEach(btn => {{
+                        btn.addEventListener('click', (e) => {{
+                            e.stopPropagation();
+                            const text = btn.dataset.text;
+                            if (text) copyMessage(text);
+                        }});
+                    }});
+                    
+                    document.querySelectorAll('.delete-btn').forEach(btn => {{
+                        btn.addEventListener('click', (e) => {{
+                            e.stopPropagation();
+                            const msgId = btn.dataset.id;
+                            const isHard = btn.dataset.hard === 'true';
+                            if (confirm(isHard ? 'Полностью удалить это сообщение? (будет удалено навсегда)' : 'Удалить это сообщение?')) {{
+                                deleteMessage(msgId, isHard);
+                            }}
+                        }});
+                    }});
+                    
+                    document.querySelectorAll('.restore-btn').forEach(btn => {{
+                        btn.addEventListener('click', (e) => {{
+                            e.stopPropagation();
+                            const msgId = btn.dataset.id;
+                            if (confirm('Восстановить это сообщение?')) {{
+                                restoreMessage(msgId);
+                            }}
+                        }});
+                    }});
+                    
+                    document.querySelectorAll('.ip').forEach(el => {{
+                        el.addEventListener('click', (e) => {{
+                            e.stopPropagation();
+                            const ip = el.dataset.ip;
+                            if (ip) copyToClipboard(ip);
+                        }});
+                    }});
+                    
                     if (wasScrolledToBottom) {{
                         chat.scrollTop = chat.scrollHeight;
                     }} else {{
@@ -963,6 +1146,7 @@ HTML = f'''<!DOCTYPE html>
                     updateCharCounter();
                     suggestionsBox.style.display = 'none';
                     currentSuggestionIndex = -1;
+                    input.blur();
                     loadMessages();
                 }} else if (data.error) {{
                     showWarning(data.error, true);
@@ -1055,13 +1239,16 @@ class MessengerHandler(BaseHTTPRequestHandler):
             messages = []
         
         messages.append({
+            'id': int(time.time() * 1000) + len(messages),
             'time': datetime.now().strftime('%H:%M:%S'),
             'nickname': nickname,
             'text': text,
+            'originalText': text,
             'ip': '0.0.0.0',
             'nicknameColor': '#888',
             'isAdmin': True,
-            'isCommand': True
+            'isCommand': True,
+            'isDeleted': False
         })
         
         if len(messages) > SAVE_LIMIT:
@@ -1086,14 +1273,17 @@ class MessengerHandler(BaseHTTPRequestHandler):
         whisper_text = f"→ {to_nickname}: {text}"
         
         messages.append({
+            'id': int(time.time() * 1000) + len(messages),
             'time': datetime.now().strftime('%H:%M:%S'),
             'nickname': from_nickname,
             'text': whisper_text,
+            'originalText': text,
             'ip': from_ip,
             'nicknameColor': from_color,
             'isAdmin': is_admin(from_ip),
             'isWhisper': True,
-            'whisperTarget': to_nickname
+            'whisperTarget': to_nickname,
+            'isDeleted': False
         })
         
         if len(messages) > SAVE_LIMIT:
@@ -1143,7 +1333,6 @@ class MessengerHandler(BaseHTTPRequestHandler):
                 for msg in messages[-DISPLAY_LIMIT:]:
                     msg_copy = msg.copy()
                     
-                    # Фильтрация шёпотов: только отправитель, получатель или хост
                     if msg_copy.get('isWhisper'):
                         target = msg_copy.get('whisperTarget')
                         is_sender = (msg_copy.get('ip') == client_ip)
@@ -1152,6 +1341,13 @@ class MessengerHandler(BaseHTTPRequestHandler):
                         
                         if not (is_sender or is_target or is_server_host):
                             continue
+                    
+                    is_deleted = msg_copy.get('isDeleted', False)
+                    if is_deleted:
+                        is_server_host = is_host
+                        if not is_server_host:
+                            continue
+                        msg_copy['isDeleted'] = True
                     
                     msg_copy['isOwn'] = (msg_copy.get('ip') == client_ip)
                     msg_copy['hasMention'] = (f'@{get_nickname(client_ip)}' in msg_copy.get('text', ''))
@@ -1200,7 +1396,61 @@ class MessengerHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_len).decode()
         params = parse_qs(body)
         
-        if self.path == '/api/heartbeat':
+        if self.path == '/api/restore_message':
+            msg_id = params.get('msg_id', [''])[0].strip()
+            if msg_id:
+                try:
+                    msg_id_int = int(msg_id)
+                    with open(MESSAGES_FILE, 'r') as f:
+                        messages = json.load(f)
+                    
+                    for msg in messages:
+                        if msg.get('id') == msg_id_int:
+                            msg['isDeleted'] = False
+                            break
+                    
+                    with open(MESSAGES_FILE, 'w') as f:
+                        json.dump(messages, f)
+                    
+                    self._send_json({'success': True})
+                except ValueError:
+                    self._send_json({'success': False, 'error': 'Неверный ID'})
+                except Exception as e:
+                    self._send_json({'success': False, 'error': str(e)})
+            else:
+                self._send_json({'success': False, 'error': 'ID не указан'})
+            return
+        
+        elif self.path == '/api/delete_message':
+            msg_id = params.get('msg_id', [''])[0].strip()
+            hard_delete = params.get('hard', ['false'])[0].strip().lower() == 'true'
+            if msg_id:
+                try:
+                    msg_id_int = int(msg_id)
+                    with open(MESSAGES_FILE, 'r') as f:
+                        messages = json.load(f)
+                    
+                    if hard_delete:
+                        messages = [msg for msg in messages if msg.get('id') != msg_id_int]
+                    else:
+                        for msg in messages:
+                            if msg.get('id') == msg_id_int:
+                                msg['isDeleted'] = True
+                                break
+                    
+                    with open(MESSAGES_FILE, 'w') as f:
+                        json.dump(messages, f)
+                    
+                    self._send_json({'success': True})
+                except ValueError:
+                    self._send_json({'success': False, 'error': 'Неверный ID'})
+                except Exception as e:
+                    self._send_json({'success': False, 'error': str(e)})
+            else:
+                self._send_json({'success': False, 'error': 'ID не указан'})
+            return
+        
+        elif self.path == '/api/heartbeat':
             if NO_ACTIVE:
                 self._send_json({'success': True})
                 return
@@ -1268,11 +1518,9 @@ class MessengerHandler(BaseHTTPRequestHandler):
                 for k in keys_to_remove:
                     del last_message_cache[k]
             
-            # Обработка команды /tell
+            # Обработка команды /tell (без кавычек)
             if text.startswith('/tell'):
-                match = re.match(r'^/tell\s+@?(\w+)\s+"(.+)"$', text)
-                if not match:
-                    match = re.match(r"^/tell\s+@?(\w+)\s+'(.+)'$", text)
+                match = re.match(r'^/tell\s+@?(\w+)\s+(.+)$', text)
                 if match:
                     target_nickname = match.group(1)
                     whisper_text = match.group(2)
@@ -1295,7 +1543,7 @@ class MessengerHandler(BaseHTTPRequestHandler):
                     self._send_json({'success': True})
                     return
                 else:
-                    self._send_json({'success': False, 'error': 'Неверный формат. Используйте: /tell @ник "сообщение"'})
+                    self._send_json({'success': False, 'error': 'Неверный формат. Используйте: /tell @ник сообщение'})
                     return
             
             if is_admin(client_ip) and text.startswith('/'):
@@ -1376,6 +1624,33 @@ class MessengerHandler(BaseHTTPRequestHandler):
                         self._send_json({'success': False, 'error': f'IP {target_ip} не найден'})
                         return
                     
+                    user_data = users[target_ip]
+                    if isinstance(user_data, dict):
+                        user_data['nickname'] = new_nickname
+                    else:
+                        old_is_admin = users[target_ip].get('is_admin', False) if isinstance(users[target_ip], dict) else False
+                        users[target_ip] = {'nickname': new_nickname, 'is_admin': old_is_admin}
+                    
+                    save_users(users)
+                    if SHOW_COMMANDS:
+                        self.add_command_message(sender_nickname, text)
+                    self._send_json({'success': True})
+                    return
+                
+                elif cmd == '/ch-u' and len(parts) == 3:
+                    target_ip = parts[1]
+                    new_nickname = parts[2]
+                    
+                    if len(new_nickname) > 20:
+                        self._send_json({'success': False, 'error': 'Новый ник слишком длинный (макс 20)'})
+                        return
+                    
+                    users = load_users()
+                    
+                    if target_ip not in users:
+                        self._send_json({'success': False, 'error': f'IP {target_ip} не найден'})
+                        return
+                    
                     old_nickname = get_nickname(target_ip)
                     user_data = users[target_ip]
                     if isinstance(user_data, dict):
@@ -1385,6 +1660,8 @@ class MessengerHandler(BaseHTTPRequestHandler):
                         users[target_ip] = {'nickname': new_nickname, 'is_admin': old_is_admin}
                     
                     save_users(users)
+                    update_nickname_in_messages(old_nickname, new_nickname)
+                    
                     if SHOW_COMMANDS:
                         self.add_command_message(sender_nickname, text)
                     self._send_json({'success': True})
@@ -1407,12 +1684,15 @@ class MessengerHandler(BaseHTTPRequestHandler):
             nickname_color = get_nickname_color(client_ip)
             
             messages.append({
+                'id': int(time.time() * 1000) + len(messages),
                 'time': datetime.now().strftime('%H:%M:%S'),
                 'nickname': get_nickname(client_ip),
                 'text': text,
+                'originalText': text,
                 'ip': client_ip,
                 'nicknameColor': nickname_color,
-                'isAdmin': is_admin(client_ip)
+                'isAdmin': is_admin(client_ip),
+                'isDeleted': False
             })
             
             if len(messages) > SAVE_LIMIT:

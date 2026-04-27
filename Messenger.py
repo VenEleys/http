@@ -1035,8 +1035,12 @@ HTML = f'''<!DOCTYPE html>
                     document.querySelectorAll('.copy-btn').forEach(btn => {{
                         btn.addEventListener('click', (e) => {{
                             e.stopPropagation();
-                            const text = btn.dataset.text;
-                            if (text) copyMessage(text);
+                            const msgDiv = btn.closest('.msg');
+                            const textElement = msgDiv.querySelector('.text');
+                            if (textElement) {{
+                                const text = textElement.innerText;
+                                copyMessage(text);
+                            }}
                         }});
                     }});
                     
@@ -1603,6 +1607,11 @@ class MessengerHandler(BaseHTTPRequestHandler):
                         
                         with open(MESSAGES_FILE, 'w') as f:
                             json.dump(combined, f)
+                        
+                        # Очищаем back.json после восстановления
+                        with open(BACKUP_FILE, 'w', encoding='utf-8') as f:
+                            json.dump([], f)
+                        
                         if SHOW_COMMANDS:
                             self.add_command_message(sender_nickname, text)
                         self._send_json({'success': True})
@@ -1739,11 +1748,11 @@ def run_server():
     print(f'Показывается последние {DISPLAY_LIMIT} сообщений')
     print(f'Максимальная длина сообщения: {MAX_MESSAGE_LENGTH} символов')
     print(f'Интервал обновления чата: {REFRESH_INTERVAL} мс')
-    print(f'При нажатии + или = (не в полях ввода) переход на: {REDIRECT_URL}')
+    print(f'Ссылка выхода: {REDIRECT_URL}')
     print(f'Показывать команды в чате: {"Да" if SHOW_COMMANDS else "Нет"}')
     print(f'Система активных пользователей: {"Выключена" if NO_ACTIVE else "Включена"}')
     if ADMIN_MODE:
-        print(f'РЕЖИМ АДМИНА: Включён (только хост видит IP)')
+        print(f'РЕЖИМ АДМИНА: Включён')
     else:
         print(f'РЕЖИМ АДМИНА: Выключен')
     HTTPServer(('', 8000), MessengerHandler).serve_forever()

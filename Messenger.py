@@ -3,14 +3,25 @@ import json
 import sys
 import socket
 import threading
+import asyncio
+import websockets
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs
 from datetime import datetime
 import time
 import re
 
-# Папка для хранения данных
-DATA_DIR = 'db'
+# Желательно изменить перед запуском
+PAGE_TITLE = "HTTP"
+REDIRECT_URL = "https://www.google.com"
+
+# Параметры запуска
+ADMIN_MODE = '-a' in sys.argv # Сразу даёт админку хосту
+SHOW_COMMANDS = '-sh' in sys.argv # Включает сообщения использованных комманд
+NO_ACTIVE = '-noact' in sys.argv # Выключает мониторинг активных пользователей (для снижения нагрузки на сеть)
+
+
+DATA_DIR = 'data'
 
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
@@ -22,22 +33,6 @@ BACKUP_FILE = os.path.join(DATA_DIR, 'back.json')
 SAVE_LIMIT = 1000
 DISPLAY_LIMIT = 75
 MAX_MESSAGE_LENGTH = 1000
-PAGE_TITLE = "HTTP"
-
-REDIRECT_URL = "https://www.google.com"
-
-ADMIN_MODE = '-a' in sys.argv
-SHOW_COMMANDS = '-sh' in sys.argv
-NO_ACTIVE = '-noact' in sys.argv
-
-REFRESH_INTERVAL = 2000
-if '-cd' in sys.argv:
-    try:
-        idx = sys.argv.index('-cd')
-        if idx + 1 < len(sys.argv):
-            REFRESH_INTERVAL = int(sys.argv[idx + 1])
-    except (ValueError, IndexError):
-        print(f'Неверное значение для -cd, используется значение по умолчанию: {REFRESH_INTERVAL}')
 
 if not os.path.exists(MESSAGES_FILE):
     with open(MESSAGES_FILE, 'w') as f:
@@ -58,6 +53,9 @@ SERVER_IP = get_local_ip()
 
 active_users = {}
 active_users_lock = threading.Lock()
+
+websocket_clients = {}
+websocket_lock = threading.Lock()
 
 last_message_cache = {}
 last_message_lock = threading.Lock()
@@ -115,13 +113,11 @@ def update_nickname_in_messages(old_nickname, new_nickname):
     try:
         with open(MESSAGES_FILE, 'r') as f:
             messages = json.load(f)
-        
         updated = False
         for msg in messages:
             if msg.get('nickname') == old_nickname:
                 msg['nickname'] = new_nickname
                 updated = True
-        
         if updated:
             with open(MESSAGES_FILE, 'w') as f:
                 json.dump(messages, f)
@@ -143,14 +139,372 @@ if SHOW_COMMANDS:
     ARGS_LIST.append('-sh')
 if NO_ACTIVE:
     ARGS_LIST.append('-noact')
-if '-cd' in sys.argv:
-    try:
-        idx = sys.argv.index('-cd')
-        if idx + 1 < len(sys.argv):
-            ARGS_LIST.append(f'-cd {sys.argv[idx + 1]}')
-    except:
-        pass
 ARGS_STRING = ' '.join(ARGS_LIST) if ARGS_LIST else 'нет'
+
+def save_message_to_file(message):
+    try:
+        with open(MESSAGES_FILE, 'r') as f:
+            content = f.read().strip()
+            if not content:
+                messages = []
+            else:
+                messages = json.loads(content)
+    except (json.JSONDecodeError, IOError):
+        messages = []
+    
+    messages.append(message)
+    
+    if len(messages) > SAVE_LIMIT:
+        messages = messages[-SAVE_LIMIT:]
+    
+    with open(MESSAGES_FILE, 'w') as f:
+        json.dump(messages, f)
+
+def add_command_message(nickname, text):
+    if not SHOW_COMMANDS:
+        return
+    messages = []
+    try:
+        with open(MESSAGES_FILE, 'r') as f:
+            content = f.read().strip()
+            if content:
+                messages = json.loads(content)
+    except (json.JSONDecodeError, IOError):
+        pass
+    
+    messages.append({
+        'id': int(time.time() * 1000) + len(messages),
+        'time': datetime.now().strftime('%H:%M:%S'),
+        'nickname': nickname,
+        'text': text,
+        'originalText': text,
+        'ip': '0.0.0.0',
+        'nicknameColor': '#888',
+        'isAdmin': True,
+        'isCommand': True,
+        'isDeleted': False
+    })
+    
+    if len(messages) > SAVE_LIMIT:
+        messages = messages[-SAVE_LIMIT:]
+    
+    with open(MESSAGES_FILE, 'w') as f:
+        json.dump(messages, f)
+
+def add_whisper_message(from_nickname, to_nickname, to_ip, text, from_ip):
+    try:
+        with open(MESSAGES_FILE, 'r') as f:
+            content = f.read().strip()
+            if not content:
+                messages = []
+            else:
+                messages = json.loads(content)
+    except (json.JSONDecodeError, IOError):
+        messages = []
+    
+    from_color = get_nickname_color(from_ip)
+    whisper_text = f"→ {to_nickname}: {text}"
+    
+    messages.append({
+        'id': int(time.time() * 1000) + len(messages),
+        'time': datetime.now().strftime('%H:%M:%S'),
+        'nickname': from_nickname,
+        'text': whisper_text,
+        'originalText': text,
+        'ip': from_ip,
+        'nicknameColor': from_color,
+        'isAdmin': is_admin(from_ip),
+        'isWhisper': True,
+        'whisperTarget': to_nickname,
+        'isDeleted': False
+    })
+    
+    if len(messages) > SAVE_LIMIT:
+        messages = messages[-SAVE_LIMIT:]
+    
+    with open(MESSAGES_FILE, 'w') as f:
+        json.dump(messages, f)
+
+async def broadcast_message(data, exclude_ip=None):
+    with websocket_lock:
+        clients = list(websocket_clients.items())
+    
+    for client_ip, websocket in clients:
+        if exclude_ip and client_ip == exclude_ip:
+            continue
+        try:
+            await websocket.send(json.dumps(data))
+        except Exception:
+            pass
+
+async def broadcast_active_users():
+    with active_users_lock:
+        users_copy = []
+        for ip, data in active_users.items():
+            users_copy.append({
+                'nickname': data.get('nickname', 'Unknown'),
+                'ip': ip,
+                'isAdmin': is_admin(ip)
+            })
+    
+    with websocket_lock:
+        clients = list(websocket_clients.items())
+    
+    data = {'type': 'active_users', 'users': users_copy}
+    for ip, websocket in clients:
+        try:
+            await websocket.send(json.dumps(data))
+        except Exception:
+            pass
+
+async def handle_websocket(websocket):
+    client_ip = websocket.remote_address[0]
+    
+    with websocket_lock:
+        websocket_clients[client_ip] = websocket
+    
+    try:
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+                msg_type = data.get('type')
+                
+                if msg_type == 'heartbeat':
+                    nickname = data.get('nickname', 'Unknown')
+                    with active_users_lock:
+                        active_users[client_ip] = {'nickname': nickname, 'ip': client_ip, 'last_seen': datetime.now().timestamp()}
+                    await broadcast_active_users()
+                    continue
+                
+                elif msg_type == 'send_message':
+                    text = data.get('text', '').strip()
+                    if not text:
+                        continue
+                    
+                    users = load_users()
+                    if client_ip not in users:
+                        continue
+                    
+                    if len(text) > MAX_MESSAGE_LENGTH:
+                        continue
+                    
+                    if text.startswith('/tell'):
+                        match = re.match(r'^/tell\s+@?(\w+)\s+(.+)$', text)
+                        if match:
+                            target_nickname = match.group(1)
+                            whisper_text = match.group(2)
+                            sender_nickname = get_nickname(client_ip)
+                            target_ip = get_ip_by_nickname(target_nickname)
+                            if target_ip and target_ip != client_ip:
+                                add_whisper_message(sender_nickname, target_nickname, target_ip, whisper_text, client_ip)
+                                with open(MESSAGES_FILE, 'r') as f:
+                                    content = f.read().strip()
+                                    if content:
+                                        msgs = json.loads(content)
+                                        last_msg = msgs[-1] if msgs else None
+                                        if last_msg:
+                                            await broadcast_message({'type': 'new_message', 'message': last_msg})
+                                        if SHOW_COMMANDS:
+                                            add_command_message(sender_nickname, text)
+                            continue
+                    
+                    if is_admin(client_ip) and text.startswith('/'):
+                        parts = text.split()
+                        cmd = parts[0].lower()
+                        sender_nickname = get_nickname(client_ip)
+                        
+                        if cmd == '/a' and len(parts) == 2:
+                            target_ip = parts[1]
+                            users = load_users()
+                            if target_ip in users:
+                                user_data = users[target_ip]
+                                if isinstance(user_data, dict):
+                                    user_data['is_admin'] = True
+                                else:
+                                    users[target_ip] = {'nickname': user_data, 'is_admin': True}
+                            else:
+                                users[target_ip] = {'nickname': 'Unknown', 'is_admin': True}
+                            save_users(users)
+                            if SHOW_COMMANDS:
+                                add_command_message(sender_nickname, text)
+                                await broadcast_message({'type': 'new_messages'})
+                            continue
+                        
+                        elif cmd == '/cl':
+                            try:
+                                with open(MESSAGES_FILE, 'r') as f:
+                                    current_messages = json.load(f)
+                                with open(BACKUP_FILE, 'w', encoding='utf-8') as f:
+                                    json.dump(current_messages, f, ensure_ascii=False, indent=2)
+                                with open(MESSAGES_FILE, 'w') as f:
+                                    json.dump([], f)
+                                if SHOW_COMMANDS:
+                                    add_command_message(sender_nickname, text)
+                                await broadcast_message({'type': 'clear_chat'})
+                            except Exception:
+                                pass
+                            continue
+                        
+                        elif cmd == '/ret':
+                            try:
+                                if not os.path.exists(BACKUP_FILE):
+                                    continue
+                                with open(BACKUP_FILE, 'r', encoding='utf-8') as f:
+                                    backup_messages = json.load(f)
+                                with open(MESSAGES_FILE, 'r') as f:
+                                    current_messages = json.load(f)
+                                combined = backup_messages + current_messages
+                                if len(combined) > SAVE_LIMIT:
+                                    combined = combined[-SAVE_LIMIT:]
+                                with open(MESSAGES_FILE, 'w') as f:
+                                    json.dump(combined, f)
+                                with open(BACKUP_FILE, 'w', encoding='utf-8') as f:
+                                    json.dump([], f)
+                                if SHOW_COMMANDS:
+                                    add_command_message(sender_nickname, text)
+                                await broadcast_message({'type': 'new_messages'})
+                            except Exception:
+                                pass
+                            continue
+                        
+                        elif cmd == '/ch' and len(parts) == 3:
+                            target_ip = parts[1]
+                            new_nickname = parts[2]
+                            if len(new_nickname) <= 20:
+                                users = load_users()
+                                if target_ip in users:
+                                    user_data = users[target_ip]
+                                    if isinstance(user_data, dict):
+                                        user_data['nickname'] = new_nickname
+                                    else:
+                                        users[target_ip] = {'nickname': new_nickname, 'is_admin': False}
+                                    save_users(users)
+                                    if SHOW_COMMANDS:
+                                        add_command_message(sender_nickname, text)
+                                    await broadcast_message({'type': 'new_messages'})
+                            continue
+                        
+                        elif cmd == '/ch-u' and len(parts) == 3:
+                            target_ip = parts[1]
+                            new_nickname = parts[2]
+                            if len(new_nickname) <= 20:
+                                users = load_users()
+                                if target_ip in users:
+                                    old_nickname = get_nickname(target_ip)
+                                    user_data = users[target_ip]
+                                    if isinstance(user_data, dict):
+                                        user_data['nickname'] = new_nickname
+                                    else:
+                                        users[target_ip] = {'nickname': new_nickname, 'is_admin': False}
+                                    save_users(users)
+                                    update_nickname_in_messages(old_nickname, new_nickname)
+                                    if SHOW_COMMANDS:
+                                        add_command_message(sender_nickname, text)
+                                    await broadcast_message({'type': 'new_messages'})
+                            continue
+                        
+                        else:
+                            continue
+                    
+                    try:
+                        with open(MESSAGES_FILE, 'r') as f:
+                            content = f.read().strip()
+                            if not content:
+                                messages = []
+                            else:
+                                messages = json.loads(content)
+                    except (json.JSONDecodeError, IOError):
+                        messages = []
+                    
+                    nickname_color = get_nickname_color(client_ip)
+                    new_msg = {
+                        'id': int(time.time() * 1000) + len(messages),
+                        'time': datetime.now().strftime('%H:%M:%S'),
+                        'nickname': get_nickname(client_ip),
+                        'text': text,
+                        'originalText': text,
+                        'ip': client_ip,
+                        'nicknameColor': nickname_color,
+                        'isAdmin': is_admin(client_ip),
+                        'isDeleted': False
+                    }
+                    
+                    messages.append(new_msg)
+                    if len(messages) > SAVE_LIMIT:
+                        messages = messages[-SAVE_LIMIT:]
+                    
+                    with open(MESSAGES_FILE, 'w') as f:
+                        json.dump(messages, f)
+                    
+                    await broadcast_message({'type': 'new_message', 'message': new_msg})
+                    continue
+                
+                elif msg_type == 'delete_message':
+                    msg_id = data.get('msg_id')
+                    hard_delete = data.get('hard', False)
+                    
+                    if msg_id:
+                        try:
+                            with open(MESSAGES_FILE, 'r') as f:
+                                messages = json.load(f)
+                            
+                            if hard_delete:
+                                messages = [msg for msg in messages if msg.get('id') != msg_id]
+                            else:
+                                for msg in messages:
+                                    if msg.get('id') == msg_id:
+                                        msg['isDeleted'] = True
+                                        break
+                            
+                            with open(MESSAGES_FILE, 'w') as f:
+                                json.dump(messages, f)
+                            
+                            await broadcast_message({
+                                'type': 'delete_message',
+                                'msg_id': msg_id,
+                                'hard': hard_delete
+                            })
+                        except Exception as e:
+                            print(f'Ошибка удаления: {e}')
+                    continue
+                
+                elif msg_type == 'restore_message':
+                    msg_id = data.get('msg_id')
+                    
+                    if msg_id:
+                        try:
+                            with open(MESSAGES_FILE, 'r') as f:
+                                messages = json.load(f)
+                            
+                            for msg in messages:
+                                if msg.get('id') == msg_id:
+                                    msg['isDeleted'] = False
+                                    break
+                            
+                            with open(MESSAGES_FILE, 'w') as f:
+                                json.dump(messages, f)
+                            
+                            await broadcast_message({
+                                'type': 'restore_message',
+                                'msg_id': msg_id
+                            })
+                        except Exception as e:
+                            print(f'Ошибка восстановления: {e}')
+                    continue
+                    
+            except json.JSONDecodeError:
+                pass
+                
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        with websocket_lock:
+            if client_ip in websocket_clients:
+                del websocket_clients[client_ip]
+        with active_users_lock:
+            if client_ip in active_users:
+                del active_users[client_ip]
+        await broadcast_active_users()
 
 HTML = f'''<!DOCTYPE html>
 <html>
@@ -182,6 +536,11 @@ HTML = f'''<!DOCTYPE html>
             border-left: 3px solid #d4a017;
             box-shadow: 0 0 5px rgba(212,160,23,0.3);
         }}
+        .msg.mention.own-message {{
+            background: #fff0d0;
+            border-left: 3px solid #d4a017;
+            box-shadow: 0 0 5px rgba(212,160,23,0.3);
+        }}
         .msg.command-message {{
             background: #e0e0e0;
             border-left: 3px solid #888;
@@ -198,7 +557,8 @@ HTML = f'''<!DOCTYPE html>
         .time {{ color: #8B6914; font-size: 12px; font-weight: 500; }}
         .ip {{ color: #888; font-size: 10px; margin-left: 5px; cursor: pointer; }}
         .ip:hover {{ text-decoration: underline; }}
-        .nickname {{ font-weight: bold; }}
+        .nickname {{ font-weight: bold; cursor: pointer; }}
+        .nickname:hover {{ text-decoration: underline; }}
         .text {{ color: #333; white-space: pre-wrap; }}
         .whisper-label {{
             color: #9b59b6;
@@ -477,6 +837,14 @@ HTML = f'''<!DOCTYPE html>
             color: #888;
             margin-top: 5px;
         }}
+        .ws-status {{
+            position: fixed;
+            bottom: 10px;
+            left: 10px;
+            font-size: 11px;
+            color: #858585;
+            z-index: 999;
+        }}
     </style>
 </head>
 <body id="mainBody">
@@ -504,10 +872,9 @@ HTML = f'''<!DOCTYPE html>
             <button class="menu-btn host-btn" id="hostMenuBtn">Хост</button>
             <div class="menu-content" id="hostMenuContent">
                 <div class="menu-item">Аргументы запуска: {ARGS_STRING}</div>
-                <div class="menu-item"><strong>-a</strong> — только хост видит IP</div>
+                <div class="menu-item"><strong>-a</strong> — дать хосту статус админа (до регистрации)</div>
                 <div class="menu-item"><strong>-sh</strong> — показывать команды в чате</div>
                 <div class="menu-item"><strong>-noact</strong> — отключить систему активных пользователей</div>
-                <div class="menu-item"><strong>-cd "мс"</strong> — интервал обновления сообщений</div>
             </div>
         </div>
     </div>
@@ -535,37 +902,213 @@ HTML = f'''<!DOCTYPE html>
         </div>
     </div>
     <div id="toast" class="toast">Скопировано!</div>
+    <div id="wsStatus" class="ws-status">● Подключено</div>
 
     <script>
         let registered = false;
         let scrollPosition = 0;
         let isAdmin = false;
         let nickname = '';
-        let heartbeatInterval = null;
         let currentUserIp = null;
         let allUsers = [];
         let currentSuggestionIndex = -1;
         let currentSuggestions = [];
         let isSending = false;
-        let reloadTimer = null;
-        let lastActivityTime = Date.now();
+        let ws = null;
 
         let NO_ACTIVE_MODE = {'true' if NO_ACTIVE else 'false'};
         let ADMIN_MODE_ACTIVE = {'true' if ADMIN_MODE else 'false'};
         let SERVER_IP_ADDR = '{SERVER_IP}';
 
-        function resetReloadTimer() {{
-            if (reloadTimer) {{
-                clearTimeout(reloadTimer);
-            }}
-            reloadTimer = setTimeout(() => {{
-                const messageInput = document.getElementById('messageInput');
-                if (messageInput && messageInput.value.trim() === '') {{
-                    location.reload();
-                }} else {{
-                    resetReloadTimer();
+        function getWebSocketUrl() {{
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            return protocol + '//' + window.location.hostname + ':8001' + '/ws';
+        }}
+
+        function connectWebSocket() {{
+            ws = new WebSocket(getWebSocketUrl());
+            
+            ws.onopen = function() {{
+                document.getElementById('wsStatus').textContent = '● Подключено';
+                document.getElementById('wsStatus').style.color = '#4ec9b0';
+                if (registered && nickname) {{
+                    sendHeartbeat();
                 }}
-            }}, 30000);
+            }};
+            
+            ws.onmessage = function(event) {{
+                try {{
+                    const data = JSON.parse(event.data);
+                    handleWebSocketMessage(data);
+                }} catch (e) {{
+                    console.log('Ошибка разбора WebSocket-сообщения:', e);
+                }}
+            }};
+            
+            ws.onclose = function() {{
+                document.getElementById('wsStatus').textContent = '● Отключено (переподключение...)';
+                document.getElementById('wsStatus').style.color = '#f48771';
+                setTimeout(connectWebSocket, 3000);
+            }};
+            
+            ws.onerror = function() {{
+                document.getElementById('wsStatus').textContent = '● Ошибка соединения';
+                document.getElementById('wsStatus').style.color = '#f48771';
+            }};
+        }}
+
+        function handleWebSocketMessage(data) {{
+            if (data.type === 'new_message') {{
+                const msg = data.message;
+                const isOwn = (msg.ip === currentUserIp);
+                const hasMention = msg.text && msg.text.includes('@' + nickname);
+                const isDeleted = msg.isDeleted || false;
+                msg.isOwn = isOwn;
+                msg.hasMention = hasMention;
+                msg.isDeleted = isDeleted;
+                addMessageToChat(msg);
+            }} else if (data.type === 'delete_message') {{
+                loadMessages();
+            }} else if (data.type === 'restore_message') {{
+                loadMessages();
+            }} else if (data.type === 'new_messages') {{
+                loadMessages();
+            }} else if (data.type === 'clear_chat') {{
+                document.getElementById('chat').innerHTML = '';
+                loadMessages();
+            }} else if (data.type === 'active_users') {{
+                allUsers = data.users.filter(u => u.nickname !== nickname);
+                updateActiveUsersList(data.users);
+            }}
+        }}
+
+        function addMessageToChat(msg) {{
+            const chat = document.getElementById('chat');
+            const wasScrolledToBottom = (chat.scrollHeight - chat.scrollTop - chat.clientHeight) < 10;
+            
+            const div = createMessageElement(msg);
+            chat.appendChild(div);
+            
+            if (wasScrolledToBottom) {{
+                chat.scrollTop = chat.scrollHeight;
+            }}
+        }}
+
+        function createMessageElement(msg) {{
+            const div = document.createElement('div');
+            div.className = 'msg';
+            const isHost = (currentUserIp === SERVER_IP_ADDR);
+            
+            const isOwn = (msg.ip === currentUserIp);
+            const hasMention = msg.text && msg.text.includes('@' + nickname);
+            const isDeleted = msg.isDeleted || false;
+            
+            if (isOwn) {{
+                div.classList.add('own-message');
+            }}
+            if (hasMention) {{
+                div.classList.add('mention');
+            }}
+            if (msg.isCommand) {{
+                div.classList.add('command-message');
+            }}
+            if (msg.isWhisper) {{
+                div.classList.add('whisper');
+            }}
+            if (isDeleted && isHost) {{
+                div.classList.add('deleted-for-host');
+            }}
+            
+            let ipHtml = '';
+            if (ADMIN_MODE_ACTIVE && msg.showIp && msg.ip) {{
+                ipHtml = `<span class="ip" data-ip="${{escapeHtml(msg.ip)}}">(${{escapeHtml(msg.ip)}})</span>`;
+            }}
+            
+            const nicknameColor = msg.nicknameColor || '#B8860B';
+            const adminBadge = msg.isAdmin ? '<span class="admin-badge-inline">A</span>' : '';
+            const whisperLabel = msg.isWhisper ? '<span class="whisper-label">[Шёпот]</span>' : '';
+            const highlightedText = highlightMentions(escapeHtml(msg.text), nickname);
+            
+            let actionsHtml = `<div class="msg-actions">
+                <button class="action-btn copy-btn" data-text="${{escapeHtml(msg.originalText || msg.text)}}">📋</button>`;
+            
+            if (isDeleted && isHost) {{
+                actionsHtml += `<button class="action-btn restore-btn" data-id="${{msg.id}}">↩️</button>`;
+                actionsHtml += `<button class="action-btn delete-btn" data-id="${{msg.id}}" data-hard="true">🗑</button>`;
+            }} else if ((isOwn || isAdmin) && !isDeleted) {{
+                actionsHtml += `<button class="action-btn delete-btn" data-id="${{msg.id}}" data-hard="false">🗑</button>`;
+            }}
+            actionsHtml += `</div>`;
+            
+            div.innerHTML = `<span class="time">[${{escapeHtml(msg.time)}}]</span>${{ipHtml}} ${{whisperLabel}}<span class="nickname" style="color: ${{nicknameColor}};" data-ip="${{msg.ip || ''}}">${{escapeHtml(msg.nickname)}}${{adminBadge}}:</span> <span class="text">${{highlightedText}}</span>${{actionsHtml}}`;
+            
+            div.querySelector('.copy-btn')?.addEventListener('click', function(e) {{
+                e.stopPropagation();
+                const text = this.dataset.text;
+                if (text) copyMessage(text);
+            }});
+            
+            div.querySelector('.delete-btn')?.addEventListener('click', function(e) {{
+                e.stopPropagation();
+                const msgId = this.dataset.id;
+                const isHard = this.dataset.hard === 'true';
+                if (confirm(isHard ? 'Полностью удалить это сообщение? (будет удалено навсегда)' : 'Удалить это сообщение?')) {{
+                    deleteMessage(msgId, isHard);
+                }}
+            }});
+            
+            div.querySelector('.restore-btn')?.addEventListener('click', function(e) {{
+                e.stopPropagation();
+                const msgId = this.dataset.id;
+                if (confirm('Восстановить это сообщение?')) {{
+                    restoreMessage(msgId);
+                }}
+            }});
+            
+            div.querySelector('.ip')?.addEventListener('click', function(e) {{
+                e.stopPropagation();
+                const ip = this.dataset.ip;
+                if (ip) copyToClipboard(ip);
+            }});
+            
+            div.querySelector('.nickname')?.addEventListener('click', function(e) {{
+                e.stopPropagation();
+                const ip = this.dataset.ip;
+                if (ip) copyToClipboard(ip);
+            }});
+            
+            return div;
+        }}
+
+        function updateActiveUsersList(users) {{
+            const container = document.getElementById('activeUsersList');
+            if (!container) return;
+            if (users.length === 0) {{
+                container.innerHTML = '<div class="active-user">Нет активных</div>';
+                return;
+            }}
+            let html = '';
+            users.forEach(user => {{
+                const adminBadge = user.isAdmin ? '<span class="active-user-badge">A</span>' : '';
+                html += `<div class="active-user" data-ip="${{user.ip}}" data-nickname="${{escapeHtml(user.nickname)}}">${{adminBadge}}${{escapeHtml(user.nickname)}}</div>`;
+            }});
+            container.innerHTML = html;
+            document.querySelectorAll('.active-user').forEach(el => {{
+                el.addEventListener('click', (e) => {{
+                    e.stopPropagation();
+                    const ip = el.dataset.ip;
+                    if (ip && isAdmin) copyToClipboard(ip);
+                }});
+            }});
+        }}
+
+        function sendHeartbeat() {{
+            if (ws && ws.readyState === WebSocket.OPEN && registered && nickname) {{
+                ws.send(JSON.stringify({{
+                    type: 'heartbeat',
+                    nickname: nickname
+                }}));
+            }}
         }}
 
         function showToast(message) {{
@@ -618,23 +1161,22 @@ HTML = f'''<!DOCTYPE html>
         }}
 
         function deleteMessage(msgId, isHard) {{
-            fetch('/api/delete_message', {{
-                method: 'POST',
-                headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
-                body: 'msg_id=' + encodeURIComponent(msgId) + '&hard=' + encodeURIComponent(isHard)
-            }}).then(() => {{
-                loadMessages();
-            }}).catch(e => console.log('Ошибка удаления:', e));
+            if (ws && ws.readyState === WebSocket.OPEN) {{
+                ws.send(JSON.stringify({{
+                    type: 'delete_message',
+                    msg_id: parseInt(msgId),
+                    hard: isHard
+                }}));
+            }}
         }}
 
         function restoreMessage(msgId) {{
-            fetch('/api/restore_message', {{
-                method: 'POST',
-                headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
-                body: 'msg_id=' + encodeURIComponent(msgId)
-            }}).then(() => {{
-                loadMessages();
-            }}).catch(e => console.log('Ошибка восстановления:', e));
+            if (ws && ws.readyState === WebSocket.OPEN) {{
+                ws.send(JSON.stringify({{
+                    type: 'restore_message',
+                    msg_id: parseInt(msgId)
+                }}));
+            }}
         }}
 
         function trackActivity() {{
@@ -643,8 +1185,6 @@ HTML = f'''<!DOCTYPE html>
         document.addEventListener('keydown', trackActivity);
         document.addEventListener('mousedown', trackActivity);
         document.addEventListener('input', trackActivity);
-
-        resetReloadTimer();
 
         const rightPanel = document.getElementById('rightPanel');
         let isResizing = false;
@@ -738,13 +1278,12 @@ HTML = f'''<!DOCTYPE html>
         }}
 
         function sendCommand(cmd) {{
-            fetch('/api/send', {{
-                method: 'POST',
-                headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
-                body: 'text=' + encodeURIComponent(cmd)
-            }}).then(() => {{
-                loadMessages();
-            }}).catch(e => console.log('Ошибка отправки команды:', e));
+            if (ws && ws.readyState === WebSocket.OPEN) {{
+                ws.send(JSON.stringify({{
+                    type: 'send_message',
+                    text: cmd
+                }}));
+            }}
         }}
 
         if (document.getElementById('adminMenuContainer')) {{
@@ -786,49 +1325,6 @@ HTML = f'''<!DOCTYPE html>
             const message = prompt('Введите сообщение:');
             if (message) sendCommand('/tell @' + nick + ' ' + message);
         }});
-
-        function startHeartbeat() {{
-            if (heartbeatInterval) clearInterval(heartbeatInterval);
-            if (NO_ACTIVE_MODE) return;
-            heartbeatInterval = setInterval(() => {{
-                if (registered && nickname) {{
-                    fetch('/api/heartbeat', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
-                        body: 'nickname=' + encodeURIComponent(nickname)
-                    }}).catch(e => console.log('Heartbeat error:', e));
-                }}
-            }}, 10000);
-        }}
-
-        function loadActiveUsers() {{
-            if (NO_ACTIVE_MODE) return;
-            fetch('/api/active_users')
-                .then(res => res.json())
-                .then(users => {{
-                    allUsers = users.filter(u => u.nickname !== nickname);
-                    const container = document.getElementById('activeUsersList');
-                    if (!container) return;
-                    if (users.length === 0) {{
-                        container.innerHTML = '<div class="active-user">Нет активных</div>';
-                        return;
-                    }}
-                    let html = '';
-                    users.forEach(user => {{
-                        const adminBadge = user.isAdmin ? '<span class="active-user-badge">A</span>' : '';
-                        html += `<div class="active-user" data-ip="${{user.ip}}" data-nickname="${{escapeHtml(user.nickname)}}">${{adminBadge}}${{escapeHtml(user.nickname)}}</div>`;
-                    }});
-                    container.innerHTML = html;
-                    document.querySelectorAll('.active-user').forEach(el => {{
-                        el.addEventListener('click', (e) => {{
-                            e.stopPropagation();
-                            const ip = el.dataset.ip;
-                            if (ip && isAdmin) copyToClipboard(ip);
-                        }});
-                    }});
-                }})
-                .catch(e => console.log('Ошибка загрузки активных пользователей:', e));
-        }}
 
         function saveScrollPosition() {{
             const chat = document.getElementById('chat');
@@ -987,92 +1483,10 @@ HTML = f'''<!DOCTYPE html>
                     const chat = document.getElementById('chat');
                     const wasScrolledToBottom = (chat.scrollHeight - chat.scrollTop - chat.clientHeight) < 10;
                     chat.innerHTML = '';
-                    const isHost = (currentUserIp === SERVER_IP_ADDR);
                     messages.forEach(msg => {{
-                        const div = document.createElement('div');
-                        div.className = 'msg';
-                        if (msg.isOwn) {{
-                            div.classList.add('own-message');
-                        }}
-                        if (msg.hasMention) {{
-                            div.classList.add('mention');
-                        }}
-                        if (msg.isCommand) {{
-                            div.classList.add('command-message');
-                        }}
-                        if (msg.isWhisper) {{
-                            div.classList.add('whisper');
-                        }}
-                        if (msg.isDeleted && isHost) {{
-                            div.classList.add('deleted-for-host');
-                        }}
-                        let ipHtml = '';
-                        if (ADMIN_MODE_ACTIVE && msg.showIp && msg.ip) {{
-                            ipHtml = `<span class="ip" data-ip="${{escapeHtml(msg.ip)}}">(${{escapeHtml(msg.ip)}})</span>`;
-                        }}
-                        const nicknameColor = msg.nicknameColor || '#B8860B';
-                        const adminBadge = msg.isAdmin ? '<span class="admin-badge-inline">A</span>' : '';
-                        const whisperLabel = msg.isWhisper ? '<span class="whisper-label">[Шёпот]</span>' : '';
-                        const highlightedText = highlightMentions(escapeHtml(msg.text), nickname);
-                        
-                        let actionsHtml = `<div class="msg-actions">
-                            <button class="action-btn copy-btn" data-text="${{escapeHtml(msg.originalText || msg.text)}}">📋</button>`;
-                        
-                        if (msg.isDeleted && isHost) {{
-                            actionsHtml += `<button class="action-btn restore-btn" data-id="${{msg.id}}">↩️</button>`;
-                            actionsHtml += `<button class="action-btn delete-btn" data-id="${{msg.id}}" data-hard="true">🗑</button>`;
-                        }} else if (msg.isOwn && !msg.isDeleted) {{
-                            actionsHtml += `<button class="action-btn delete-btn" data-id="${{msg.id}}" data-hard="false">🗑</button>`;
-                        }} else if (isAdmin && !msg.isDeleted) {{
-                            actionsHtml += `<button class="action-btn delete-btn" data-id="${{msg.id}}" data-hard="false">🗑</button>`;
-                        }}
-                        actionsHtml += `</div>`;
-                        
-                        div.innerHTML = `<span class="time">[${{escapeHtml(msg.time)}}]</span>${{ipHtml}} ${{whisperLabel}}<span class="nickname" style="color: ${{nicknameColor}};">${{escapeHtml(msg.nickname)}}${{adminBadge}}:</span> <span class="text">${{highlightedText}}</span>${{actionsHtml}}`;
+                        const div = createMessageElement(msg);
                         chat.appendChild(div);
                     }});
-                    
-                    document.querySelectorAll('.copy-btn').forEach(btn => {{
-                        btn.addEventListener('click', (e) => {{
-                            e.stopPropagation();
-                            const msgDiv = btn.closest('.msg');
-                            const textElement = msgDiv.querySelector('.text');
-                            if (textElement) {{
-                                const text = textElement.innerText;
-                                copyMessage(text);
-                            }}
-                        }});
-                    }});
-                    
-                    document.querySelectorAll('.delete-btn').forEach(btn => {{
-                        btn.addEventListener('click', (e) => {{
-                            e.stopPropagation();
-                            const msgId = btn.dataset.id;
-                            const isHard = btn.dataset.hard === 'true';
-                            if (confirm(isHard ? 'Полностью удалить это сообщение? (будет удалено навсегда)' : 'Удалить это сообщение?')) {{
-                                deleteMessage(msgId, isHard);
-                            }}
-                        }});
-                    }});
-                    
-                    document.querySelectorAll('.restore-btn').forEach(btn => {{
-                        btn.addEventListener('click', (e) => {{
-                            e.stopPropagation();
-                            const msgId = btn.dataset.id;
-                            if (confirm('Восстановить это сообщение?')) {{
-                                restoreMessage(msgId);
-                            }}
-                        }});
-                    }});
-                    
-                    document.querySelectorAll('.ip').forEach(el => {{
-                        el.addEventListener('click', (e) => {{
-                            e.stopPropagation();
-                            const ip = el.dataset.ip;
-                            if (ip) copyToClipboard(ip);
-                        }});
-                    }});
-                    
                     if (wasScrolledToBottom) {{
                         chat.scrollTop = chat.scrollHeight;
                     }} else {{
@@ -1104,7 +1518,8 @@ HTML = f'''<!DOCTYPE html>
                         }}
                         document.getElementById('warning').innerHTML = '✅ Ваше имя "' + escapeHtml(data.nickname) + '" закреплено, изменить нельзя. Напишите в чат с просьбой об изменении.' + (isAdmin ? ' (администратор)' : '');
                         document.getElementById('warning').className = 'warning success';
-                        startHeartbeat();
+                        sendHeartbeat();
+                        loadMessages();
                     }}
                 }})
                 .catch(e => console.log('Ошибка проверки:', e));
@@ -1119,7 +1534,7 @@ HTML = f'''<!DOCTYPE html>
             }});
         }}
 
-        async function sendMessage() {{
+        function sendMessage() {{
             if (isSending) {{
                 showWarning('Подождите, сообщение уже отправляется...', true);
                 return;
@@ -1139,21 +1554,18 @@ HTML = f'''<!DOCTYPE html>
             sendBtn.textContent = 'Отправка...';
             
             try {{
-                const response = await fetch('/api/send', {{
-                    method: 'POST',
-                    headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
-                    body: 'text=' + encodeURIComponent(text)
-                }});
-                const data = await response.json();
-                if (data.success) {{
+                if (ws && ws.readyState === WebSocket.OPEN) {{
+                    ws.send(JSON.stringify({{
+                        type: 'send_message',
+                        text: text
+                    }}));
                     input.value = '';
                     updateCharCounter();
                     suggestionsBox.style.display = 'none';
                     currentSuggestionIndex = -1;
                     input.blur();
-                    loadMessages();
-                }} else if (data.error) {{
-                    showWarning(data.error, true);
+                }} else {{
+                    showWarning('Нет соединения с сервером', true);
                 }}
             }} catch (e) {{
                 console.log('Ошибка отправки:', e);
@@ -1191,7 +1603,8 @@ HTML = f'''<!DOCTYPE html>
                     }}
                     document.getElementById('warning').innerHTML = '✅ Имя "' + escapeHtml(nicknameVal) + '" закреплено, изменить нельзя. Напишите в чат с просьбой об изменении.' + (isAdmin ? ' (администратор)' : '');
                     document.getElementById('warning').className = 'warning success';
-                    startHeartbeat();
+                    sendHeartbeat();
+                    loadMessages();
                 }} else {{
                     showWarning(data.error, true);
                 }}
@@ -1217,85 +1630,15 @@ HTML = f'''<!DOCTYPE html>
 
         document.getElementById('sendBtn').addEventListener('click', sendMessage);
 
-        setInterval(loadMessages, {REFRESH_INTERVAL});
-        if (!NO_ACTIVE_MODE) {{
-            setInterval(loadActiveUsers, 5000);
-        }}
+        connectWebSocket();
+        setInterval(sendHeartbeat, 5000);
         checkRegistration();
-        loadMessages();
         updateCharCounter();
     </script>
 </body>
 </html>'''
 
-class MessengerHandler(BaseHTTPRequestHandler):
-    def add_command_message(self, nickname, text):
-        if not SHOW_COMMANDS:
-            return
-        try:
-            with open(MESSAGES_FILE, 'r') as f:
-                content = f.read().strip()
-                if not content:
-                    messages = []
-                else:
-                    messages = json.loads(content)
-        except (json.JSONDecodeError, IOError):
-            messages = []
-        
-        messages.append({
-            'id': int(time.time() * 1000) + len(messages),
-            'time': datetime.now().strftime('%H:%M:%S'),
-            'nickname': nickname,
-            'text': text,
-            'originalText': text,
-            'ip': '0.0.0.0',
-            'nicknameColor': '#888',
-            'isAdmin': True,
-            'isCommand': True,
-            'isDeleted': False
-        })
-        
-        if len(messages) > SAVE_LIMIT:
-            messages = messages[-SAVE_LIMIT:]
-        
-        with open(MESSAGES_FILE, 'w') as f:
-            json.dump(messages, f)
-
-    def add_whisper_message(self, from_nickname, to_nickname, to_ip, text, from_ip):
-        try:
-            with open(MESSAGES_FILE, 'r') as f:
-                content = f.read().strip()
-                if not content:
-                    messages = []
-                else:
-                    messages = json.loads(content)
-        except (json.JSONDecodeError, IOError):
-            messages = []
-        
-        from_color = get_nickname_color(from_ip)
-        
-        whisper_text = f"→ {to_nickname}: {text}"
-        
-        messages.append({
-            'id': int(time.time() * 1000) + len(messages),
-            'time': datetime.now().strftime('%H:%M:%S'),
-            'nickname': from_nickname,
-            'text': whisper_text,
-            'originalText': text,
-            'ip': from_ip,
-            'nicknameColor': from_color,
-            'isAdmin': is_admin(from_ip),
-            'isWhisper': True,
-            'whisperTarget': to_nickname,
-            'isDeleted': False
-        })
-        
-        if len(messages) > SAVE_LIMIT:
-            messages = messages[-SAVE_LIMIT:]
-        
-        with open(MESSAGES_FILE, 'w') as f:
-            json.dump(messages, f)
-
+class HTTPHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/':
             self.send_response(200)
@@ -1305,22 +1648,6 @@ class MessengerHandler(BaseHTTPRequestHandler):
         elif self.path == '/api/get_my_ip':
             client_ip = self.client_address[0]
             self._send_json({'ip': client_ip})
-        elif self.path == '/api/active_users':
-            if NO_ACTIVE:
-                self._send_json([])
-                return
-            with active_users_lock:
-                users_copy = []
-                for ip, data in active_users.items():
-                    users_copy.append({
-                        'nickname': data.get('nickname', 'Unknown'),
-                        'ip': ip,
-                        'isAdmin': is_admin(ip)
-                    })
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(users_copy).encode())
         elif self.path == '/api/messages':
             client_ip = self.client_address[0]
             is_host = (client_ip == SERVER_IP)
@@ -1357,22 +1684,16 @@ class MessengerHandler(BaseHTTPRequestHandler):
                     msg_copy['hasMention'] = (f'@{get_nickname(client_ip)}' in msg_copy.get('text', ''))
                     msg_copy['isAdmin'] = is_admin(msg_copy.get('ip', '0.0.0.0'))
                     msg_copy['showIp'] = is_host
+                    msg_copy['nicknameColor'] = get_nickname_color(msg_copy.get('ip', '0.0.0.0'))
                     
                     if not ADMIN_MODE:
                         msg_copy.pop('ip', None)
                     
                     processed_messages.append(msg_copy)
                 
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps(processed_messages).encode())
+                self._send_json(processed_messages)
             except (json.JSONDecodeError, IOError):
-                messages = []
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps([]).encode())
+                self._send_json([])
         elif self.path == '/api/check':
             client_ip = self.client_address[0]
             try:
@@ -1393,78 +1714,14 @@ class MessengerHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
-
+    
     def do_POST(self):
         client_ip = self.client_address[0]
         content_len = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_len).decode()
         params = parse_qs(body)
         
-        if self.path == '/api/restore_message':
-            msg_id = params.get('msg_id', [''])[0].strip()
-            if msg_id:
-                try:
-                    msg_id_int = int(msg_id)
-                    with open(MESSAGES_FILE, 'r') as f:
-                        messages = json.load(f)
-                    
-                    for msg in messages:
-                        if msg.get('id') == msg_id_int:
-                            msg['isDeleted'] = False
-                            break
-                    
-                    with open(MESSAGES_FILE, 'w') as f:
-                        json.dump(messages, f)
-                    
-                    self._send_json({'success': True})
-                except ValueError:
-                    self._send_json({'success': False, 'error': 'Неверный ID'})
-                except Exception as e:
-                    self._send_json({'success': False, 'error': str(e)})
-            else:
-                self._send_json({'success': False, 'error': 'ID не указан'})
-            return
-        
-        elif self.path == '/api/delete_message':
-            msg_id = params.get('msg_id', [''])[0].strip()
-            hard_delete = params.get('hard', ['false'])[0].strip().lower() == 'true'
-            if msg_id:
-                try:
-                    msg_id_int = int(msg_id)
-                    with open(MESSAGES_FILE, 'r') as f:
-                        messages = json.load(f)
-                    
-                    if hard_delete:
-                        messages = [msg for msg in messages if msg.get('id') != msg_id_int]
-                    else:
-                        for msg in messages:
-                            if msg.get('id') == msg_id_int:
-                                msg['isDeleted'] = True
-                                break
-                    
-                    with open(MESSAGES_FILE, 'w') as f:
-                        json.dump(messages, f)
-                    
-                    self._send_json({'success': True})
-                except ValueError:
-                    self._send_json({'success': False, 'error': 'Неверный ID'})
-                except Exception as e:
-                    self._send_json({'success': False, 'error': str(e)})
-            else:
-                self._send_json({'success': False, 'error': 'ID не указан'})
-            return
-        
-        elif self.path == '/api/heartbeat':
-            if NO_ACTIVE:
-                self._send_json({'success': True})
-                return
-            nickname = params.get('nickname', ['Unknown'])[0].strip()
-            with active_users_lock:
-                active_users[client_ip] = {'nickname': nickname, 'ip': client_ip, 'last_seen': datetime.now().timestamp()}
-            self._send_json({'success': True})
-            return
-            
-        elif self.path == '/api/register':
+        if self.path == '/api/register':
             nickname = params.get('nickname', [''])[0].strip()
             if not nickname:
                 self._send_json({'success': False, 'error': 'Имя не может быть пустым'})
@@ -1493,224 +1750,7 @@ class MessengerHandler(BaseHTTPRequestHandler):
             save_users(users)
             
             self._send_json({'success': True, 'nickname': nickname, 'isAdmin': is_admin_status, 'ip': client_ip})
-            
-        elif self.path == '/api/send':
-            users = load_users()
-            
-            if client_ip not in users:
-                self._send_json({'success': False, 'error': 'Сначала зарегистрируйтесь'})
-                return
-            
-            text = params.get('text', [''])[0].strip()
-            if not text:
-                self._send_json({'success': False, 'error': 'Сообщение пустое'})
-                return
-            if len(text) > MAX_MESSAGE_LENGTH:
-                self._send_json({'success': False, 'error': f'Сообщение слишком длинное! Максимум {MAX_MESSAGE_LENGTH} символов'})
-                return
-            
-            current_time = time.time()
-            with last_message_lock:
-                last_key = f"{client_ip}:{text}"
-                if last_key in last_message_cache:
-                    last_time = last_message_cache[last_key]
-                    if current_time - last_time < 2:
-                        self._send_json({'success': False, 'error': 'Вы слишком быстро отправляете сообщения'})
-                        return
-                last_message_cache[last_key] = current_time
-                keys_to_remove = [k for k, v in last_message_cache.items() if current_time - v > 5]
-                for k in keys_to_remove:
-                    del last_message_cache[k]
-            
-            # Обработка команды /tell (без кавычек)
-            if text.startswith('/tell'):
-                match = re.match(r'^/tell\s+@?(\w+)\s+(.+)$', text)
-                if match:
-                    target_nickname = match.group(1)
-                    whisper_text = match.group(2)
-                    sender_nickname = get_nickname(client_ip)
-                    
-                    target_ip = get_ip_by_nickname(target_nickname)
-                    if target_ip is None:
-                        self._send_json({'success': False, 'error': f'Пользователь @{target_nickname} не найден'})
-                        return
-                    
-                    if target_ip == client_ip:
-                        self._send_json({'success': False, 'error': 'Нельзя отправить шёпот самому себе'})
-                        return
-                    
-                    self.add_whisper_message(sender_nickname, target_nickname, target_ip, whisper_text, client_ip)
-                    
-                    if SHOW_COMMANDS:
-                        self.add_command_message(sender_nickname, text)
-                    
-                    self._send_json({'success': True})
-                    return
-                else:
-                    self._send_json({'success': False, 'error': 'Неверный формат. Используйте: /tell @ник сообщение'})
-                    return
-            
-            if is_admin(client_ip) and text.startswith('/'):
-                parts = text.split()
-                cmd = parts[0].lower()
-                sender_nickname = get_nickname(client_ip)
-                
-                if cmd == '/a' and len(parts) == 2:
-                    target_ip = parts[1]
-                    users = load_users()
-                    if target_ip in users:
-                        user_data = users[target_ip]
-                        if isinstance(user_data, dict):
-                            user_data['is_admin'] = True
-                        else:
-                            users[target_ip] = {'nickname': user_data, 'is_admin': True}
-                        save_users(users)
-                    else:
-                        users[target_ip] = {'nickname': 'Unknown', 'is_admin': True}
-                        save_users(users)
-                    if SHOW_COMMANDS:
-                        self.add_command_message(sender_nickname, text)
-                    self._send_json({'success': True})
-                    return
-                
-                elif cmd == '/cl':
-                    try:
-                        with open(MESSAGES_FILE, 'r') as f:
-                            current_messages = json.load(f)
-                        with open(BACKUP_FILE, 'w', encoding='utf-8') as f:
-                            json.dump(current_messages, f, ensure_ascii=False, indent=2)
-                        with open(MESSAGES_FILE, 'w') as f:
-                            json.dump([], f)
-                        if SHOW_COMMANDS:
-                            self.add_command_message(sender_nickname, text)
-                        self._send_json({'success': True})
-                    except Exception as e:
-                        self._send_json({'success': False, 'error': f'Ошибка: {e}'})
-                    return
-                
-                elif cmd == '/ret':
-                    try:
-                        if not os.path.exists(BACKUP_FILE):
-                            self._send_json({'success': False, 'error': 'Файл back.json не найден'})
-                            return
-                        
-                        with open(BACKUP_FILE, 'r', encoding='utf-8') as f:
-                            backup_messages = json.load(f)
-                        
-                        with open(MESSAGES_FILE, 'r') as f:
-                            current_messages = json.load(f)
-                        
-                        combined = backup_messages + current_messages
-                        
-                        if len(combined) > SAVE_LIMIT:
-                            combined = combined[-SAVE_LIMIT:]
-                        
-                        with open(MESSAGES_FILE, 'w') as f:
-                            json.dump(combined, f)
-                        
-                        # Очищаем back.json после восстановления
-                        with open(BACKUP_FILE, 'w', encoding='utf-8') as f:
-                            json.dump([], f)
-                        
-                        if SHOW_COMMANDS:
-                            self.add_command_message(sender_nickname, text)
-                        self._send_json({'success': True})
-                    except Exception as e:
-                        self._send_json({'success': False, 'error': f'Ошибка: {e}'})
-                    return
-                
-                elif cmd == '/ch' and len(parts) == 3:
-                    target_ip = parts[1]
-                    new_nickname = parts[2]
-                    
-                    if len(new_nickname) > 20:
-                        self._send_json({'success': False, 'error': 'Новый ник слишком длинный (макс 20)'})
-                        return
-                    
-                    users = load_users()
-                    
-                    if target_ip not in users:
-                        self._send_json({'success': False, 'error': f'IP {target_ip} не найден'})
-                        return
-                    
-                    user_data = users[target_ip]
-                    if isinstance(user_data, dict):
-                        user_data['nickname'] = new_nickname
-                    else:
-                        old_is_admin = users[target_ip].get('is_admin', False) if isinstance(users[target_ip], dict) else False
-                        users[target_ip] = {'nickname': new_nickname, 'is_admin': old_is_admin}
-                    
-                    save_users(users)
-                    if SHOW_COMMANDS:
-                        self.add_command_message(sender_nickname, text)
-                    self._send_json({'success': True})
-                    return
-                
-                elif cmd == '/ch-u' and len(parts) == 3:
-                    target_ip = parts[1]
-                    new_nickname = parts[2]
-                    
-                    if len(new_nickname) > 20:
-                        self._send_json({'success': False, 'error': 'Новый ник слишком длинный (макс 20)'})
-                        return
-                    
-                    users = load_users()
-                    
-                    if target_ip not in users:
-                        self._send_json({'success': False, 'error': f'IP {target_ip} не найден'})
-                        return
-                    
-                    old_nickname = get_nickname(target_ip)
-                    user_data = users[target_ip]
-                    if isinstance(user_data, dict):
-                        user_data['nickname'] = new_nickname
-                    else:
-                        old_is_admin = users[target_ip].get('is_admin', False) if isinstance(users[target_ip], dict) else False
-                        users[target_ip] = {'nickname': new_nickname, 'is_admin': old_is_admin}
-                    
-                    save_users(users)
-                    update_nickname_in_messages(old_nickname, new_nickname)
-                    
-                    if SHOW_COMMANDS:
-                        self.add_command_message(sender_nickname, text)
-                    self._send_json({'success': True})
-                    return
-                
-                else:
-                    self._send_json({'success': True})
-                    return
-            
-            try:
-                with open(MESSAGES_FILE, 'r') as f:
-                    content = f.read().strip()
-                    if not content:
-                        messages = []
-                    else:
-                        messages = json.loads(content)
-            except (json.JSONDecodeError, IOError):
-                messages = []
-            
-            nickname_color = get_nickname_color(client_ip)
-            
-            messages.append({
-                'id': int(time.time() * 1000) + len(messages),
-                'time': datetime.now().strftime('%H:%M:%S'),
-                'nickname': get_nickname(client_ip),
-                'text': text,
-                'originalText': text,
-                'ip': client_ip,
-                'nicknameColor': nickname_color,
-                'isAdmin': is_admin(client_ip),
-                'isDeleted': False
-            })
-            
-            if len(messages) > SAVE_LIMIT:
-                messages = messages[-SAVE_LIMIT:]
-            
-            with open(MESSAGES_FILE, 'w') as f:
-                json.dump(messages, f)
-            
-            self._send_json({'success': True})
+        
         else:
             self.send_response(404)
             self.end_headers()
@@ -1724,38 +1764,40 @@ class MessengerHandler(BaseHTTPRequestHandler):
         except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
             pass
 
-def cleanup_active_users():
-    if NO_ACTIVE:
-        return
-    import time
+async def cleanup_active_users():
     while True:
-        time.sleep(30)
+        await asyncio.sleep(30)
         with active_users_lock:
             now = datetime.now().timestamp()
             to_remove = [ip for ip, data in active_users.items() if now - data.get('last_seen', 0) > 30]
             for ip in to_remove:
                 del active_users[ip]
+        await broadcast_active_users()
 
-def run_server():
-    if not NO_ACTIVE:
-        cleanup_thread = threading.Thread(target=cleanup_active_users, daemon=True)
-        cleanup_thread.start()
+async def start_websocket_server():
+    async with websockets.serve(handle_websocket, "0.0.0.0", 8001):
+        await asyncio.Future()
+
+def run_http_server():
+    httpd = HTTPServer(('', 8000), HTTPHandler)
+    httpd.serve_forever()
+
+async def main():
+    http_thread = threading.Thread(target=run_http_server, daemon=True)
+    http_thread.start()
     
-    print(f'Мессенджер запущен на http://localhost:8000')
-    print(f'  - http://{SERVER_IP}:8000')
-    print(f'Данные хранятся в папке: {DATA_DIR}')
-    print(f'Сохраняется максимум {SAVE_LIMIT} сообщений')
-    print(f'Показывается последние {DISPLAY_LIMIT} сообщений')
-    print(f'Максимальная длина сообщения: {MAX_MESSAGE_LENGTH} символов')
-    print(f'Интервал обновления чата: {REFRESH_INTERVAL} мс')
-    print(f'Ссылка выхода: {REDIRECT_URL}')
-    print(f'Показывать команды в чате: {"Да" if SHOW_COMMANDS else "Нет"}')
-    print(f'Система активных пользователей: {"Выключена" if NO_ACTIVE else "Включена"}')
-    if ADMIN_MODE:
-        print(f'РЕЖИМ АДМИНА: Включён')
-    else:
-        print(f'РЕЖИМ АДМИНА: Выключен')
-    HTTPServer(('', 8000), MessengerHandler).serve_forever()
+    asyncio.create_task(cleanup_active_users())
+    
+    print(f'HTTP сервер: http://{SERVER_IP}:8000')
+    print(f'Данные: {DATA_DIR}')
+    print(f'Сохраняется сообщений: {SAVE_LIMIT} (макс), отображается: {DISPLAY_LIMIT}')
+    print(f'Макс. длина сообщения: {MAX_MESSAGE_LENGTH} символов')
+    print(f'Выход: {REDIRECT_URL}')
+    print(f'Команды в чате: {"Да" if SHOW_COMMANDS else "Нет"}')
+    print(f'Активные пользователи: {"Выключена" if NO_ACTIVE else "Включена"}')
+    print(f'Режим админа: {"Включён" if ADMIN_MODE else "Выключен"}')
+    
+    await start_websocket_server()
 
 if __name__ == '__main__':
-    run_server()
+    asyncio.run(main())
